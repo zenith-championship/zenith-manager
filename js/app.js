@@ -2,8 +2,10 @@ import { loadDB, getDB, setViewSeasonId } from './services/storage.js';
 import { registerRoute, startRouter, navigate } from './router.js';
 import { initEmoji } from './services/emoji.js';
 import { state, loadActiveDivision, saveActiveDivision } from './state.js';
-import { initSync } from './services/sync.js';
-import { refreshAuthState, bindTopbarPublishButton } from './views/config.js';
+import { initRealtimeSync, captureCurrentHashes, notifyChange, getSyncState, forcePull } from './services/sync.js';
+import { refreshAuthState, bindTopbarStatusButton, setupSyncChipListener } from './views/config.js';
+import { downloadAll } from './services/supabase.js';
+import { setRawDB, persist } from './services/storage.js';
 
 import { dashboardView, bindDashboardEvents } from './views/dashboard.js';
 import { teamsView, bindTeamsEvents } from './views/teams.js';
@@ -20,6 +22,10 @@ import { marketView, bindMarketEvents } from './views/market.js';
 window.addEventListener('error', e => console.error('[ZENITH] error:', e.error || e.message));
 window.addEventListener('unhandledrejection', e => console.error('[ZENITH] promise rejected:', e.reason));
 
+// Exponer hooks al window para storage.js
+window.__zenithCaptureHashes = captureCurrentHashes;
+window.__zenithNotifyChange = notifyChange;
+
 // ---------- BOOT ----------
 async function boot(){
   try{
@@ -32,28 +38,36 @@ async function boot(){
       if(state.divisionId) saveActiveDivision(state.divisionId);
     }
 
-    // ─── INIT SYNC ───
-    initSync();
-    // Registrar hook global que usa storage.mutate()
-    window.__zenithNotifyChange = () => {
-      import('./services/sync.js').then(({ notifyChange }) => notifyChange());
-    };
-
     // ─── INIT AUTH ───
     try {
       await refreshAuthState();
-      bindTopbarPublishButton();
+      bindTopbarStatusButton();
+      setupSyncChipListener();
     } catch(authErr){
       console.warn('[ZENITH] Auth init falló (posible offline):', authErr);
     }
 
-    // Escuchar eventos de sync
-    window.addEventListener('zenith:published', (e) => {
-      console.log('[APP] Publicado:', e.detail);
-    });
-    window.addEventListener('zenith:publish-failed', (e) => {
-      console.warn('[APP] Publicación fallida:', e.detail);
-    });
+    // ─── INIT SYNC ───
+    await initRealtimeSync();
+
+    // Si está logueado, descarga inmediata
+    if (window.__zenithIsAuthenticated && window.__zenithIsAuthenticated()) {
+      setTimeout(async () => {
+        try {
+          const remoteDB = await downloadAll();
+          const localRaw = getDB();
+          const merged = {
+            ...remoteDB,
+            widgets: localRaw?.widgets || remoteDB.widgets,
+            viewSeasonId: localRaw?.viewSeasonId || null
+          };
+          setRawDB(merged);
+          window.dispatchEvent(new HashChangeEvent('hashchange'));
+        } catch(e) {
+          console.warn('[ZENITH] Descarga inicial falló:', e);
+        }
+      }, 500);
+    }
 
   }catch(err){
     console.error('[ZENITH] Boot error:', err);
@@ -125,6 +139,12 @@ startRouter((viewFn, params) => {
   renderView(viewFn, params);
 });
 
+// ─── Listener para re-render cuando llega sync remoto ───
+window.addEventListener('zenith:sync-pulled', () => {
+  console.log('[APP] Datos actualizados desde Supabase');
+  refreshView();
+});
+
 function updateActiveNav(){
   const current = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/')[0];
   document.querySelectorAll('.nav-item').forEach(a => {
@@ -153,7 +173,6 @@ function updateDivisionHeader(){
   const nameEl = document.getElementById('currentDivisionName');
   if(nameEl && active) nameEl.textContent = active.name;
 
-  // Chip de temporada
   const viewingId = db.viewSeasonId;
   let season;
   if(viewingId){
@@ -164,7 +183,6 @@ function updateDivisionHeader(){
   const chipSeason = document.getElementById('currentSeasonName');
   if(chipSeason && season) chipSeason.textContent = season.name;
 
-  // Chip MODO LECTURA
   const roChip = document.getElementById('readOnlyChip');
   if(roChip){
     roChip.style.display = viewingId ? '' : 'none';
@@ -222,7 +240,6 @@ function buildSeasonDropdown(){
 
   const viewingId = db.viewSeasonId;
   const activeSeason = db.seasons.find(s => s.active);
-
   const archived = [...(db.archivedSeasons || [])].sort((a,b) =>
     (b.archivedAt || '').localeCompare(a.archivedAt || '')
   );
@@ -299,7 +316,6 @@ document.getElementById('seasonBtn')?.addEventListener('click', (e) => {
   }
 });
 
-// Cerrar dropdowns al click afuera
 document.addEventListener('click', (e) => {
   const dd = document.getElementById('divisionDropdown');
   if(dd && !dd.classList.contains('hidden')){
@@ -311,10 +327,8 @@ document.addEventListener('click', (e) => {
   }
 });
 
-// ---------- Emoji ----------
 initEmoji();
 
-// ---------- UTILS ----------
 function esc(str){
   return String(str ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
 }
