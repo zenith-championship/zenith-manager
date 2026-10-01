@@ -3,10 +3,6 @@
 // ============================================================
 import { downloadAll, pushTables, subscribeRealtime, unsubscribeRealtime } from './supabase.js';
 
-// Tablas que se sincronizan en tiempo real (cambios frecuentes)
-const REALTIME_TABLES = new Set(['teams', 'players', 'matches', 'news']);
-
-// Mapeo de tabla → key en la DB local
 const TABLE_TO_KEY = {
   seasons: 'seasons',
   divisions: 'divisions',
@@ -30,70 +26,57 @@ let _realtimeCooldownUntil = 0;
 let _initialized = false;
 
 // ============================================================
-// HELPERS
+// HASH
 // ============================================================
 function hashString(str) {
   let h = 5381;
   for (let i = 0; i < str.length; i++) {
     h = ((h << 5) + h) + str.charCodeAt(i);
-    h = h & h; // 32-bit
+    h = h & h;
   }
   return (h >>> 0).toString(36);
 }
 
 function hashTable(data) {
-  try {
-    return hashString(JSON.stringify(data ?? null));
-  } catch(_) {
-    return 'err';
-  }
+  try { return hashString(JSON.stringify(data ?? null)); }
+  catch(_) { return 'err'; }
 }
 
-// ============================================================
-// DETECCIÓN DE CAMBIOS
-// ============================================================
-const _lastHashes = {};
-
-export function captureHashes(db) {
-  const newHashes = {};
+export function captureCurrentHashes() {
+  const db = window.__zenithGetRawDB ? window.__zenithGetRawDB() : null;
+  if (!db) return {};
+  const hashes = {};
   Object.entries(TABLE_TO_KEY).forEach(([table, key]) => {
     if (key === 'config') {
-      const cfg = {
-        config: db.config,
-        widgets: db.widgets,
-        trophies: db.trophies,
-        transferLog: db.transferLog,
-        transferBannerBg: db.transferBannerBg
-      };
-      newHashes[table] = hashTable(cfg);
+      hashes[table] = hashTable({
+        config: db.config, widgets: db.widgets, trophies: db.trophies,
+        transferLog: db.transferLog, transferBannerBg: db.transferBannerBg
+      });
     } else {
-      newHashes[table] = hashTable(db[key]);
+      hashes[table] = hashTable(db[key]);
     }
   });
-  return newHashes;
+  return hashes;
 }
 
-function detectDirtyTables(oldHashes, newHashes) {
+function detectDirty(oldHashes, newHashes) {
   const dirty = [];
   for (const table of Object.keys(newHashes)) {
-    if (oldHashes[table] !== newHashes[table]) {
-      dirty.push(table);
-    }
+    if (oldHashes[table] !== newHashes[table]) dirty.push(table);
   }
   return dirty;
 }
 
 // ============================================================
-// HOOK: Llamado por storage.mutate()
+// HOOK: llamado por storage.mutate()
 // ============================================================
 export function notifyChange(oldHashes, newHashes) {
-  const dirty = detectDirtyTables(oldHashes, newHashes);
-  dirty.forEach(t => _dirtyTables.add(t));
+  const dirty = detectDirty(oldHashes, newHashes);
+  if (dirty.length === 0) return;
 
-  if (dirty.length > 0) {
-    updateSyncChip('pending');
-    schedulePush();
-  }
+  dirty.forEach(t => _dirtyTables.add(t));
+  updateSyncChip('pending');
+  schedulePush();
 }
 
 function schedulePush() {
@@ -104,13 +87,8 @@ function schedulePush() {
 }
 
 async function doPush() {
-  if (_isPushing) return;
-  if (_dirtyTables.size === 0) return;
-  if (Date.now() < _realtimeCooldownUntil) {
-    // Esperar un poco más para no chocar con realtime
-    schedulePush();
-    return;
-  }
+  if (_isPushing || _dirtyTables.size === 0) return;
+  if (Date.now() < _realtimeCooldownUntil) { schedulePush(); return; }
 
   _isPushing = true;
   updateSyncChip('syncing');
@@ -124,14 +102,12 @@ async function doPush() {
 
     _lastPushAt = Date.now();
     _realtimeCooldownUntil = Date.now() + REALTIME_COOLDOWN_MS;
-
     updateSyncChip('synced');
     console.log('[SYNC] Push OK:', result.stats);
     window.dispatchEvent(new CustomEvent('zenith:sync-pushed', { detail: result }));
 
   } catch(err) {
     console.error('[SYNC] Push failed:', err);
-    // Re-marcar tablas como sucias para reintentar
     tablesToPush.forEach(t => _dirtyTables.add(t));
     updateSyncChip('error');
     setTimeout(() => schedulePush(), 5000);
@@ -141,21 +117,15 @@ async function doPush() {
 }
 
 // ============================================================
-// REALTIME: Cambios remotos
+// REALTIME
 // ============================================================
 let _realtimeDebounce = null;
 
 function onRemoteChange(table) {
-  // Ignorar si estamos en cooldown post-push (podría ser nuestro propio cambio)
-  if (Date.now() < _realtimeCooldownUntil) {
-    return;
-  }
-  // Ignorar si estamos en medio de un push
+  if (Date.now() < _realtimeCooldownUntil) return;
   if (_isPushing) return;
 
-  console.log('[SYNC] Cambio remoto detectado en:', table);
-
-  // Debounce para agrupar cambios
+  console.log('[SYNC] Cambio remoto en:', table);
   if (_realtimeDebounce) clearTimeout(_realtimeDebounce);
   _realtimeDebounce = setTimeout(() => {
     pullFromRemote().catch(err => console.error('[SYNC] pull error:', err));
@@ -166,29 +136,24 @@ async function pullFromRemote() {
   try {
     updateSyncChip('pulling');
     const remoteDB = await downloadAll();
-
-    // Preservar preferencias locales (widgets por instancia, etc.)
     const localRaw = window.__zenithGetRawDB ? window.__zenithGetRawDB() : null;
 
-    // Merge inteligente:
-    // - Tablas de tiempo real: reemplazar
-    // - Config: preservar widgets locales si existen
+    // ✅ FIX: Servidor es fuente de verdad. Solo preservamos viewSeasonId (local).
     const merged = {
       ...remoteDB,
-      widgets: localRaw?.widgets || remoteDB.widgets,
       viewSeasonId: localRaw?.viewSeasonId || null
     };
 
-    if (window.__zenithSetRawDB) {
-      window.__zenithSetRawDB(merged);
-    }
+    if (window.__zenithSetRawDB) window.__zenithSetRawDB(merged);
 
-    // Resetear hashes (para no marcar como dirty)
-    Object.assign(_lastHashes, captureHashes(merged));
+    // Resetear hashes para no marcar como dirty por cambios remotos
+    if (window.__zenithCaptureHashes) {
+      const newHashes = window.__zenithCaptureHashes();
+      console.log('[SYNC] Hashes reseteados tras pull remoto');
+    }
 
     updateSyncChip('synced');
     window.dispatchEvent(new CustomEvent('zenith:sync-pulled'));
-
   } catch(err) {
     console.error('[SYNC] Pull failed:', err);
     updateSyncChip('error');
@@ -196,7 +161,7 @@ async function pullFromRemote() {
 }
 
 // ============================================================
-// CHIP DE ESTADO
+// CHIP
 // ============================================================
 function updateSyncChip(state) {
   window.dispatchEvent(new CustomEvent('zenith:sync-chip', { detail: state }));
@@ -208,15 +173,11 @@ function updateSyncChip(state) {
 export async function initRealtimeSync() {
   if (_initialized) return;
   _initialized = true;
-
   subscribeRealtime(onRemoteChange);
-
-  // Resetear cooldown al boot
   _realtimeCooldownUntil = Date.now() + 1000;
-  updateSyncChip('synced');
+  updateSyncChip(navigator.onLine ? 'synced' : 'offline');
 
-  // Actualizar chip cuando cambie la conexión
-  window.addEventListener('online', () => updateSyncChip('online'));
+  window.addEventListener('online', () => updateSyncChip('synced'));
   window.addEventListener('offline', () => updateSyncChip('offline'));
 }
 
@@ -226,10 +187,13 @@ export function destroySync() {
 }
 
 // ============================================================
-// FORZAR SYNC MANUAL (para debug/uso)
+// MANUAL
 // ============================================================
 export async function forcePull() {
+  // Forzar pull: resetear flag de descarga inicial
+  window.__zenithHasDownloadedThisSession = false;
   await pullFromRemote();
+  window.__zenithHasDownloadedThisSession = true;
 }
 
 export async function forcePush() {
@@ -237,9 +201,6 @@ export async function forcePush() {
   await doPush();
 }
 
-// ============================================================
-// STATE
-// ============================================================
 export function getSyncState() {
   return {
     dirtyCount: _dirtyTables.size,
@@ -247,10 +208,4 @@ export function getSyncState() {
     isPushing: _isPushing,
     isOnline: navigator.onLine
   };
-}
-
-export function captureCurrentHashes() {
-  const db = window.__zenithGetRawDB ? window.__zenithGetRawDB() : null;
-  if (!db) return {};
-  return captureHashes(db);
 }
