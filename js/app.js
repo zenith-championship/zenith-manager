@@ -1,11 +1,11 @@
-import { loadDB, getDB, setViewSeasonId } from './services/storage.js';
+import { loadDB, getDB, getRawDB, setRawDB, setViewSeasonId } from './services/storage.js';
 import { registerRoute, startRouter, navigate } from './router.js';
 import { initEmoji } from './services/emoji.js';
 import { state, loadActiveDivision, saveActiveDivision } from './state.js';
-import { initRealtimeSync, captureCurrentHashes, notifyChange, getSyncState, forcePull } from './services/sync.js';
-import { refreshAuthState, bindTopbarStatusButton, setupSyncChipListener } from './views/config.js';
+import { initRealtimeSync, captureCurrentHashes, notifyChange, getSyncState } from './services/sync.js';
+import { refreshAuthState, bindTopbarStatusButton, setupSyncChipListener, isAuthenticated } from './views/config.js';
 import { downloadAll } from './services/supabase.js';
-import { setRawDB, persist } from './services/storage.js';
+import { openModal, closeTopModal, toast } from './services/ui.js';
 
 import { dashboardView, bindDashboardEvents } from './views/dashboard.js';
 import { teamsView, bindTeamsEvents } from './views/teams.js';
@@ -26,57 +26,202 @@ window.addEventListener('unhandledrejection', e => console.error('[ZENITH] promi
 window.__zenithCaptureHashes = captureCurrentHashes;
 window.__zenithNotifyChange = notifyChange;
 
-// ---------- BOOT ----------
+// Flag anti-doble-descarga
+window.__zenithHasDownloadedThisSession = false;
+
+// ============================================================
+// OVERLAY DE CARGA
+// ============================================================
+function createLoadOverlay(){
+  if (document.getElementById('zenithLoadOverlay')) return;
+  const div = document.createElement('div');
+  div.id = 'zenithLoadOverlay';
+  div.className = 'zenith-load-overlay';
+  div.innerHTML = `
+    <div class="zenith-load-card">
+      <div class="zenith-spinner"></div>
+      <div class="zenith-load-title" id="zenithLoadTitle">Cargando datos del servidor...</div>
+      <div class="zenith-load-sub">Sincronizando con el servidor</div>
+    </div>`;
+  document.body.appendChild(div);
+}
+
+function showLoadOverlay(text){
+  const overlay = document.getElementById('zenithLoadOverlay');
+  if (!overlay) return;
+  const title = document.getElementById('zenithLoadTitle');
+  if (title && text) title.textContent = text;
+  // Forzar reflow para que la transición funcione
+  void overlay.offsetWidth;
+  overlay.classList.add('visible');
+}
+
+function hideLoadOverlay(){
+  const overlay = document.getElementById('zenithLoadOverlay');
+  if (!overlay) return;
+  overlay.classList.remove('visible');
+}
+
+// ============================================================
+// CONFIRM DISCARDS CHANGES
+// ============================================================
+function confirmDiscardChanges(count){
+  return new Promise((resolve) => {
+    let resolved = false;
+    const safeResolve = (v) => { if (!resolved) { resolved = true; resolve(v); } };
+
+    openModal({
+      id: 'confirm-discard-changes',
+      title: '⚠ CAMBIOS SIN SINCRONIZAR',
+      body: `
+        <div style="text-align:center;padding:8px 0 16px">
+          <div style="font-size:48px;margin-bottom:12px">⚠</div>
+          <p style="color:var(--silver);font-size:13px;line-height:1.7;margin-bottom:14px">
+            Tienes <strong style="color:var(--gold)">${count} cambio${count !== 1 ? 's' : ''}</strong> sin sincronizar con el servidor.
+          </p>
+          <p style="color:var(--muted);font-size:12px;line-height:1.7">
+            Si descargas los datos del servidor, <strong style="color:var(--danger)">perderás esos cambios locales</strong>.
+            ¿Qué prefieres hacer?
+          </p>
+        </div>
+      `,
+      footer: `
+        <button class="btn btn-ghost" id="cancelDiscard">CANCELAR LOGIN</button>
+        <button class="btn btn-danger" id="confirmDiscard">DESCARTAR Y DESCARGAR</button>
+      `,
+      onMount: root => {
+        root.querySelector('#cancelDiscard').addEventListener('click', () => {
+          closeTopModal();
+          safeResolve(false);
+        });
+        root.querySelector('#confirmDiscard').addEventListener('click', () => {
+          closeTopModal();
+          safeResolve(true);
+        });
+      },
+      onClose: () => safeResolve(false)
+    });
+  });
+}
+
+// ============================================================
+// DESCARGA INICIAL (llamada desde boot y desde login)
+// ============================================================
+export async function performInitialDownload(opts = {}){
+  const { skipConfirm = false, reason = 'boot' } = opts;
+
+  // Evitar dobles descargas en la misma sesión
+  if (window.__zenithHasDownloadedThisSession) {
+    console.log('[APP] Ya se descargó en esta sesión, skip');
+    return { skipped: true };
+  }
+
+  if (!isAuthenticated()) {
+    return { skipped: true, error: 'no-auth' };
+  }
+
+  // Verificar cambios pendientes
+  const syncState = getSyncState();
+  if (syncState.dirtyCount > 0 && !skipConfirm) {
+    const confirmed = await confirmDiscardChanges(syncState.dirtyCount);
+    if (!confirmed) {
+      return { cancelled: true };
+    }
+  }
+
+  showLoadOverlay(reason === 'login' ? 'Cargando datos del servidor...' : 'Sincronizando al entrar...');
+
+  try {
+    const remoteDB = await downloadAll();
+    const localRaw = getRawDB();
+
+    // ✅ FIX: El servidor es la fuente de verdad. Solo preservamos viewSeasonId (local).
+    const merged = {
+      ...remoteDB,
+      viewSeasonId: localRaw?.viewSeasonId || null
+    };
+
+    setRawDB(merged);
+
+    // Validar que la división activa siga existiendo
+    const dbAfter = getDB();
+    const visible = dbAfter.divisions.filter(d => d.visible !== false);
+    if (!dbAfter.divisions.find(d => d.id === state.divisionId)) {
+      state.divisionId = visible[0]?.id || dbAfter.divisions[0]?.id || null;
+      if (state.divisionId) saveActiveDivision(state.divisionId);
+    }
+
+    window.__zenithHasDownloadedThisSession = true;
+
+    // Resetear hashes para no marcar como dirty
+    if (window.__zenithCaptureHashes) {
+      window.__zenithCaptureHashes();
+    }
+
+    refreshView();
+    console.log('[APP] Descarga inicial OK');
+    return { ok: true };
+
+  } catch(err) {
+    console.error('[APP] Descarga inicial falló:', err);
+    toast('Error al cargar datos: ' + err.message, 'error');
+    return { error: err.message };
+  } finally {
+    hideLoadOverlay();
+  }
+}
+
+// Exponer al window para que config.js lo use
+window.__zenithPerformInitialDownload = performInitialDownload;
+
+// ============================================================
+// BOOT
+// ============================================================
 async function boot(){
-  try{
+  try {
+    createLoadOverlay();
+
+    // Cargar DB local primero (rápido, muestra lo que hay)
     loadDB();
     loadActiveDivision();
     const db = getDB();
     const visible = db.divisions.filter(d => d.visible !== false);
-    if(!state.divisionId || !db.divisions.find(d => d.id === state.divisionId)){
+    if (!state.divisionId || !db.divisions.find(d => d.id === state.divisionId)) {
       state.divisionId = visible[0]?.id || db.divisions[0]?.id || null;
-      if(state.divisionId) saveActiveDivision(state.divisionId);
+      if (state.divisionId) saveActiveDivision(state.divisionId);
     }
 
-    // ─── INIT AUTH ───
+    // Init auth
     try {
       await refreshAuthState();
       bindTopbarStatusButton();
       setupSyncChipListener();
-    } catch(authErr){
-      console.warn('[ZENITH] Auth init falló (posible offline):', authErr);
+    } catch(authErr) {
+      console.warn('[ZENITH] Auth init falló:', authErr);
     }
 
-    // ─── INIT SYNC ───
+    // Init realtime
     await initRealtimeSync();
 
-    // Si está logueado, descarga inmediata
-    if (window.__zenithIsAuthenticated && window.__zenithIsAuthenticated()) {
-      setTimeout(async () => {
-        try {
-          const remoteDB = await downloadAll();
-          const localRaw = getDB();
-          const merged = {
-            ...remoteDB,
-            widgets: localRaw?.widgets || remoteDB.widgets,
-            viewSeasonId: localRaw?.viewSeasonId || null
-          };
-          setRawDB(merged);
-          window.dispatchEvent(new HashChangeEvent('hashchange'));
-        } catch(e) {
-          console.warn('[ZENITH] Descarga inicial falló:', e);
-        }
-      }, 500);
+    // Descarga automática si está autenticado
+    if (isAuthenticated()) {
+      // Pequeño delay para que el DOM esté listo
+      await new Promise(r => setTimeout(r, 100));
+      await performInitialDownload({ reason: 'boot' });
     }
 
-  }catch(err){
+    console.log('[APP] Boot completo');
+
+  } catch(err) {
     console.error('[ZENITH] Boot error:', err);
+    hideLoadOverlay();
   }
 }
-
 boot();
 
-// ---------- RUTAS ----------
+// ============================================================
+// RUTAS
+// ============================================================
 registerRoute('dashboard', dashboardView);
 registerRoute('teams',     teamsView);
 registerRoute('players',   playersView);
@@ -89,13 +234,15 @@ registerRoute('config',    configView);
 registerRoute('ballonDor', ballonDorView);
 registerRoute('market',    marketView);
 
-// ---------- RENDER ----------
+// ============================================================
+// RENDER
+// ============================================================
 let _currentViewFn = null;
 let _currentParams = [];
 
 function renderView(viewFn, params){
   const view = document.getElementById('view');
-  try{
+  try {
     view.innerHTML = viewFn(params);
 
     safeBind(bindDashboardEvents);
@@ -113,7 +260,7 @@ function renderView(viewFn, params){
     updateActiveNav();
     updateDivisionHeader();
     window.scrollTo(0, 0);
-  }catch(err){
+  } catch(err) {
     console.error('[ZENITH] Render error:', err);
     view.innerHTML = `
       <div class="card" style="border-left:3px solid var(--danger)">
@@ -125,12 +272,12 @@ function renderView(viewFn, params){
 }
 
 function safeBind(fn){
-  try{ fn?.(); }
-  catch(e){ console.error('[ZENITH] bind error en', fn?.name, e); }
+  try { fn?.(); }
+  catch(e) { console.error('[ZENITH] bind error en', fn?.name, e); }
 }
 
 export function refreshView(){
-  if(_currentViewFn) renderView(_currentViewFn, _currentParams);
+  if (_currentViewFn) renderView(_currentViewFn, _currentParams);
 }
 
 startRouter((viewFn, params) => {
@@ -139,12 +286,15 @@ startRouter((viewFn, params) => {
   renderView(viewFn, params);
 });
 
-// ─── Listener para re-render cuando llega sync remoto ───
+// Listener para re-render cuando llega sync remoto
 window.addEventListener('zenith:sync-pulled', () => {
-  console.log('[APP] Datos actualizados desde Supabase');
+  console.log('[APP] Datos actualizados desde Supabase (realtime)');
   refreshView();
 });
 
+// ============================================================
+// NAV
+// ============================================================
 function updateActiveNav(){
   const current = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/')[0];
   document.querySelectorAll('.nav-item').forEach(a => {
@@ -154,9 +304,9 @@ function updateActiveNav(){
 
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-route]');
-  if(!el) return;
+  if (!el) return;
   const route = el.dataset.route;
-  if(!route) return;
+  if (!route) return;
   e.preventDefault();
   navigate(route);
   document.getElementById('sidebar')?.classList.remove('open');
@@ -166,35 +316,35 @@ document.getElementById('menuToggle')?.addEventListener('click', () => {
   document.getElementById('sidebar')?.classList.toggle('open');
 });
 
-// ---------- HEADER ----------
+// ============================================================
+// HEADER
+// ============================================================
 function updateDivisionHeader(){
   const db = getDB();
   const active = db.divisions.find(d => d.id === state.divisionId) || db.divisions[0];
   const nameEl = document.getElementById('currentDivisionName');
-  if(nameEl && active) nameEl.textContent = active.name;
+  if (nameEl && active) nameEl.textContent = active.name;
 
   const viewingId = db.viewSeasonId;
   let season;
-  if(viewingId){
+  if (viewingId) {
     season = (db.archivedSeasons || []).find(s => s.id === viewingId) || null;
   } else {
     season = db.seasons.find(s => s.active) || db.seasons[0] || null;
   }
   const chipSeason = document.getElementById('currentSeasonName');
-  if(chipSeason && season) chipSeason.textContent = season.name;
+  if (chipSeason && season) chipSeason.textContent = season.name;
 
   const roChip = document.getElementById('readOnlyChip');
-  if(roChip){
-    roChip.style.display = viewingId ? '' : 'none';
-  }
+  if (roChip) roChip.style.display = viewingId ? '' : 'none';
 }
 
 function buildDivisionDropdown(){
   const db = getDB();
   const dropdown = document.getElementById('divisionDropdown');
-  if(!dropdown) return;
+  if (!dropdown) return;
   const visible = db.divisions.filter(d => d.visible !== false);
-  if(visible.length === 0){
+  if (visible.length === 0) {
     dropdown.innerHTML = `<div class="division-dropdown-empty">Sin divisiones</div>`;
     return;
   }
@@ -223,8 +373,8 @@ function buildDivisionDropdown(){
 document.getElementById('divisionBtn')?.addEventListener('click', (e) => {
   e.stopPropagation();
   const dropdown = document.getElementById('divisionDropdown');
-  if(!dropdown) return;
-  if(dropdown.classList.contains('hidden')){
+  if (!dropdown) return;
+  if (dropdown.classList.contains('hidden')) {
     buildDivisionDropdown();
     dropdown.classList.remove('hidden');
   } else {
@@ -232,15 +382,14 @@ document.getElementById('divisionBtn')?.addEventListener('click', (e) => {
   }
 });
 
-// ---------- SEASON DROPDOWN ----------
 function buildSeasonDropdown(){
   const db = getDB();
   const dropdown = document.getElementById('seasonDropdown');
-  if(!dropdown) return;
+  if (!dropdown) return;
 
   const viewingId = db.viewSeasonId;
   const activeSeason = db.seasons.find(s => s.active);
-  const archived = [...(db.archivedSeasons || [])].sort((a,b) =>
+  const archived = [...(db.archivedSeasons || [])].sort((a, b) =>
     (b.archivedAt || '').localeCompare(a.archivedAt || '')
   );
 
@@ -276,7 +425,7 @@ function buildSeasonDropdown(){
 
   dropdown.querySelectorAll('[data-season-id]').forEach(btn => {
     btn.addEventListener('click', (e) => {
-      if(e.target.closest('[data-export-season]')) return;
+      if (e.target.closest('[data-export-season]')) return;
       const id = btn.dataset.seasonId || null;
       switchToSeason(id);
       dropdown.classList.add('hidden');
@@ -298,17 +447,17 @@ function switchToSeason(seasonId){
 
   const db = getDB();
   const visible = db.divisions.filter(d => d.visible !== false);
-  if(!db.divisions.find(d => d.id === state.divisionId)){
+  if (!db.divisions.find(d => d.id === state.divisionId)) {
     state.divisionId = visible[0]?.id || db.divisions[0]?.id || null;
-    if(state.divisionId) saveActiveDivision(state.divisionId);
+    if (state.divisionId) saveActiveDivision(state.divisionId);
   }
 }
 
 document.getElementById('seasonBtn')?.addEventListener('click', (e) => {
   e.stopPropagation();
   const dropdown = document.getElementById('seasonDropdown');
-  if(!dropdown) return;
-  if(dropdown.classList.contains('hidden')){
+  if (!dropdown) return;
+  if (dropdown.classList.contains('hidden')) {
     buildSeasonDropdown();
     dropdown.classList.remove('hidden');
   } else {
@@ -318,12 +467,12 @@ document.getElementById('seasonBtn')?.addEventListener('click', (e) => {
 
 document.addEventListener('click', (e) => {
   const dd = document.getElementById('divisionDropdown');
-  if(dd && !dd.classList.contains('hidden')){
-    if(!e.target.closest('#divisionSelector')) dd.classList.add('hidden');
+  if (dd && !dd.classList.contains('hidden')) {
+    if (!e.target.closest('#divisionSelector')) dd.classList.add('hidden');
   }
   const sd = document.getElementById('seasonDropdown');
-  if(sd && !sd.classList.contains('hidden')){
-    if(!e.target.closest('#seasonSelector')) sd.classList.add('hidden');
+  if (sd && !sd.classList.contains('hidden')) {
+    if (!e.target.closest('#seasonSelector')) sd.classList.add('hidden');
   }
 });
 
