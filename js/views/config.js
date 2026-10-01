@@ -12,25 +12,24 @@ import {
 import { canFinishSeason, finishSeason, resetDivisions } from '../services/seasons.js';
 import { uid, getDefaultWidgets, getWidgetType } from '../data/database.js';
 import { state } from '../state.js';
-import { publishToSupabase, testConnection } from '../services/supabase.js';
+import { getSupabase, testConnection, downloadAll, forcePull as forcePullSupabase } from '../services/supabase.js';
 import { login, logout, getCurrentUser } from '../services/auth.js';
-import { getSyncState, setAutoSyncEnabled, setBackupEnabled } from '../services/sync.js';
+import { forcePush, forcePull, getSyncState } from '../services/sync.js';
 
 let configTab = 'general';
 let _authUser = null;
 
 // ============================================================
-// AUTH STATE
+// AUTH
 // ============================================================
 export async function refreshAuthState(){
-  try {
-    _authUser = await getCurrentUser();
-  } catch(_) {
-    _authUser = null;
-  }
+  try { _authUser = await getCurrentUser(); }
+  catch(_) { _authUser = null; }
   updateTopbarPublishButton();
   return _authUser;
 }
+
+export function isAuthenticated(){ return !!_authUser; }
 
 export function updateTopbarPublishButton(){
   const icon = document.getElementById('publishTopbarIcon');
@@ -53,17 +52,54 @@ export function updateTopbarPublishButton(){
   }
 }
 
-export function bindTopbarPublishButton(){
+export function bindTopbarStatusButton(){
   const btn = document.getElementById('btnPublishTopbar');
   if (!btn || btn.dataset.bound === '1') return;
   btn.dataset.bound = '1';
   btn.addEventListener('click', async () => {
-    if (_authUser) {
-      openPublishModal();
-    } else {
-      openLoginModal();
-    }
+    if (_authUser) openPublishModal();
+    else openLoginModal();
   });
+}
+
+export function setupSyncChipListener(){
+  window.addEventListener('zenith:sync-chip', (e) => {
+    updateSyncChipUI(e.detail);
+  });
+  window.addEventListener('zenith:realtime-status', (e) => {
+    console.log('[CONFIG] Realtime status:', e.detail);
+  });
+  updateSyncChipUI(navigator.onLine ? 'synced' : 'offline');
+}
+
+function updateSyncChipUI(state){
+  const chip = document.getElementById('syncChip');
+  if (!chip) return;
+
+  chip.classList.remove('sync-online', 'sync-offline', 'sync-syncing', 'sync-error', 'sync-pulling', 'sync-pending');
+
+  const labels = {
+    online: '🟢 ONLINE',
+    synced: '🟢 SYNC',
+    syncing: '📡 SINCRONIZANDO',
+    pulling: '⬇ DESCARGANDO',
+    pending: '⏳ PENDIENTE',
+    offline: '🔴 OFFLINE',
+    error: '⚠ ERROR'
+  };
+
+  const classMap = {
+    online: 'sync-online',
+    synced: 'sync-online',
+    syncing: 'sync-syncing',
+    pulling: 'sync-syncing',
+    pending: 'sync-syncing',
+    offline: 'sync-offline',
+    error: 'sync-error'
+  };
+
+  chip.textContent = labels[state] || '⚪';
+  chip.classList.add(classMap[state] || '');
 }
 
 // ============================================================
@@ -75,7 +111,8 @@ export function openLoginModal(){
     title: 'INICIAR SESIÓN',
     body: `
       <p style="font-size:12px;color:var(--muted);margin-bottom:14px;line-height:1.6">
-        Inicia sesión con tu cuenta de Supabase para publicar en el visualizador.
+        Inicia sesión con tu cuenta de Supabase. Al hacer login, se descargarán automáticamente
+        los datos más recientes del servidor.
       </p>
       <div class="field">
         <label>Email</label>
@@ -109,16 +146,29 @@ export function openLoginModal(){
         try {
           const user = await login(email, pass);
           _authUser = user;
-          errEl.innerHTML = '';
+          errEl.innerHTML = '<div style="color:var(--accent);font-size:12px">Descargando datos del servidor...</div>';
           toast(`Bienvenido, ${user.email}`, 'success');
+
+          // Descargar datos
+          try {
+            const remoteDB = await downloadAll();
+            const localRaw = getDB();
+            const merged = {
+              ...remoteDB,
+              widgets: localRaw?.widgets || remoteDB.widgets,
+              viewSeasonId: localRaw?.viewSeasonId || null
+            };
+            const { setRawDB } = await import('../services/storage.js');
+            setRawDB(merged);
+            toast('Datos descargados', 'success');
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
+          } catch(dlErr) {
+            console.warn('[CONFIG] Descarga inicial falló:', dlErr);
+            toast('Login OK. Descarga inicial falló: ' + dlErr.message, 'error');
+          }
+
           closeTopModal();
           updateTopbarPublishButton();
-          if (configTab === 'data') {
-            const db = getDB();
-            const ai = db.config.ai || {};
-            document.getElementById('configContent').innerHTML = renderConfigTab(configTab, db, ai);
-            bindConfigEvents();
-          }
         } catch(e) {
           errEl.innerHTML = `<div style="color:var(--danger);font-size:12px">${e.message}</div>`;
           btn.disabled = false;
@@ -134,7 +184,7 @@ export function openLoginModal(){
 }
 
 // ============================================================
-// MODAL DE PUBLICAR
+// MODAL DE PUBLICAR (FORZAR PUSH MANUAL)
 // ============================================================
 export function openPublishModal(){
   const db = getDB();
@@ -142,12 +192,17 @@ export function openPublishModal(){
 
   openModal({
     id: 'publish-confirm',
-    title: '☁ PUBLICAR EN EL VISUALIZADOR',
+    title: '☁ FORZAR PUBLICACIÓN',
     wide: true,
     body: `
       <p style="font-size:13px;color:var(--silver);line-height:1.7;margin-bottom:16px">
-        Se subirán <b>todos los datos actuales</b> al visualizador público. Este proceso reemplaza
+        Se subirán <b>todos los datos actuales</b> al servidor. Esto reemplaza
         lo que estaba publicado previamente.
+      </p>
+      <p style="font-size:12px;color:var(--gold);background:rgba(230,196,118,.08);
+                border:1px solid rgba(230,196,118,.3);border-radius:6px;padding:10px;line-height:1.6;margin-bottom:16px">
+        ⚠ <b>Nota:</b> En el modo tiempo real híbrido, los cambios ya se publican automáticamente
+        (con 2s de debounce). Este botón solo fuerza un push inmediato de TODAS las tablas.
       </p>
 
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px">
@@ -160,23 +215,16 @@ export function openPublishModal(){
       </div>
 
       <div style="background:var(--bg-graphite);border:1px solid var(--border-soft);border-radius:8px;padding:12px;font-size:12px;color:var(--muted);line-height:1.7">
-        <div style="margin-bottom:6px">
-          <b style="color:var(--silver-light)">Cuenta:</b> ${_authUser?.email || '—'}
-        </div>
-        <div style="margin-bottom:6px">
-          <b style="color:var(--silver-light)">Cambios pendientes:</b> ${sync.changeCount}
-        </div>
-        <div>
-          <b style="color:var(--silver-light)">Última publicación:</b>
-          ${sync.lastPublish ? new Date(sync.lastPublish.at).toLocaleString() : 'Nunca'}
-        </div>
+        <div style="margin-bottom:6px"><b style="color:var(--silver-light)">Cuenta:</b> ${_authUser?.email || '—'}</div>
+        <div style="margin-bottom:6px"><b style="color:var(--silver-light)">Cambios pendientes:</b> ${sync.dirtyCount}</div>
+        <div><b style="color:var(--silver-light)">Último push:</b> ${sync.lastPushAt ? new Date(sync.lastPushAt).toLocaleString() : 'Nunca'}</div>
       </div>
 
       <div id="publishProgress" style="margin-top:16px"></div>
     `,
     footer: `
       <button class="btn btn-ghost" data-close>CANCELAR</button>
-      <button class="btn btn-primary" id="doPublish">☁ PUBLICAR AHORA</button>
+      <button class="btn btn-primary" id="doPublish">☁ FORZAR PUBLICACIÓN</button>
     `,
     onMount: root => {
       const btn = root.querySelector('#doPublish');
@@ -185,35 +233,27 @@ export function openPublishModal(){
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         btn.textContent = 'PUBLICANDO...';
+        prog.innerHTML = '<div style="font-size:12px;color:var(--accent);padding:8px 0">Enviando datos…</div>';
 
         try {
-          const result = await publishToSupabase(msg => {
-            prog.innerHTML = `<div style="font-size:12px;color:var(--accent);padding:8px 0">${msg}</div>`;
-          });
+          const startedAt = Date.now();
+          await forcePush();
+          const elapsed = ((Date.now() - startedAt) / 1000).toFixed(2);
 
           prog.innerHTML = `
             <div style="background:rgba(99,194,138,.08);border:1px solid rgba(99,194,138,.3);border-radius:8px;padding:14px;margin-top:8px">
-              <div style="color:var(--success);font-size:13px;font-weight:600;margin-bottom:8px">
-                ✅ Publicación exitosa en ${result.elapsed}s
+              <div style="color:var(--success);font-size:13px;font-weight:600">
+                ✅ Publicación exitosa en ${elapsed}s
               </div>
-              <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;font-size:11.5px;color:var(--silver)">
-                ${Object.entries(result.stats).map(([k, v]) => `<div>${k}: <b>${v}</b></div>`).join('')}
-              </div>
-            </div>
-          `;
+            </div>`;
           btn.textContent = '✓ PUBLICADO';
-          toast('Datos publicados en el visualizador', 'success');
-          window.dispatchEvent(new CustomEvent('zenith:published', { detail: result }));
-
+          toast('Datos publicados', 'success');
         } catch(e) {
           prog.innerHTML = `
             <div style="background:rgba(226,92,92,.08);border:1px solid rgba(226,92,92,.3);border-radius:8px;padding:14px;margin-top:8px">
-              <div style="color:var(--danger);font-size:13px;font-weight:600;margin-bottom:4px">
-                ❌ Error al publicar
-              </div>
+              <div style="color:var(--danger);font-size:13px;font-weight:600;margin-bottom:4px">❌ Error</div>
               <div style="font-size:12px;color:var(--silver);word-break:break-word">${e.message}</div>
-            </div>
-          `;
+            </div>`;
           btn.disabled = false;
           btn.textContent = 'REINTENTAR';
         }
@@ -876,63 +916,38 @@ function renderData(){
   return `
     <div class="card" style="border-left:4px solid var(--accent);margin-bottom:20px">
       <div class="card-header">
-        <div class="card-title"><span class="dot">◆</span>PUBLICAR EN EL VISUALIZADOR</div>
+        <div class="card-title"><span class="dot">◆</span>SINCRONIZACIÓN EN TIEMPO REAL</div>
         <span class="chip ${loggedIn ? 'chip-accent' : ''}" style="font-size:10px">
           ${loggedIn ? '● CONECTADO' : '○ DESCONECTADO'}
         </span>
       </div>
 
       <p style="font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:16px">
-        Publica los datos del gestor a la base de datos de Supabase. El visualizador público
-        leerá estos datos automáticamente (y en tiempo real).
+        Los cambios en <b style="color:var(--silver-light)">equipos, jugadores, partidos y noticias</b>
+        se sincronizan automáticamente con el servidor (2s de debounce).
+        Los cambios en configuración y temporadas requieren push manual.
       </p>
 
       <div style="background:var(--bg-graphite);border:1px solid var(--border-soft);border-radius:8px;padding:12px;margin-bottom:16px">
         <div style="font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:6px">CUENTA</div>
         ${loggedIn
-          ? `<div style="font-size:13px;color:var(--silver-light);margin-bottom:10px">
-               ${esc(_authUser.email)}
-             </div>
+          ? `<div style="font-size:13px;color:var(--silver-light);margin-bottom:10px">${esc(_authUser.email)}</div>
              <div style="display:flex;gap:8px;flex-wrap:wrap">
-               <button class="btn btn-sm btn-primary" id="btnPublishFromConfig">☁ PUBLICAR AHORA</button>
+               <button class="btn btn-sm" id="btnForcePull">⬇ DESCARGAR DEL SERVIDOR</button>
+               <button class="btn btn-sm" id="btnForcePush">☁ FORZAR PUBLICACIÓN</button>
                <button class="btn btn-sm" id="btnLogout">CERRAR SESIÓN</button>
                <button class="btn btn-sm" id="btnTestConn">PROBAR CONEXIÓN</button>
              </div>`
-          : `<div style="font-size:13px;color:var(--silver-light);margin-bottom:10px">
-               No has iniciado sesión.
-             </div>
+          : `<div style="font-size:13px;color:var(--silver-light);margin-bottom:10px">No has iniciado sesión.</div>
              <button class="btn btn-sm btn-primary" id="btnLoginFromConfig">🔒 INICIAR SESIÓN</button>`}
       </div>
 
-      ${sync.lastPublish ? `
-        <div style="background:var(--bg-graphite);border:1px solid var(--border-soft);border-radius:8px;padding:12px;margin-bottom:16px">
-          <div style="font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:6px">ÚLTIMA PUBLICACIÓN</div>
-          <div style="font-size:12.5px;color:var(--silver-light)">
-            ${new Date(sync.lastPublish.at).toLocaleString()} · ${sync.lastPublish.elapsed}s
-          </div>
-          <div style="font-size:11px;color:var(--muted);margin-top:4px">
-            Motivo: ${sync.lastPublish.reason === 'manual' ? 'Manual' : sync.lastPublish.reason === 'threshold' ? 'Auto (umbral)' : 'Auto (tiempo)'}
-          </div>
-        </div>
-      ` : ''}
-
       <div style="background:var(--bg-graphite);border:1px solid var(--border-soft);border-radius:8px;padding:12px">
-        <div style="font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:10px">AUTO-SYNC</div>
-
-        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--silver-light);cursor:pointer;margin-bottom:10px">
-          <input type="checkbox" id="autoSyncToggle" ${sync.autoSyncEnabled ? 'checked' : ''}>
-          Publicar automáticamente
-        </label>
-
-        <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--silver-light);cursor:pointer;margin-bottom:10px">
-          <input type="checkbox" id="backupBeforeToggle" ${sync.backupBefore ? 'checked' : ''}>
-          Descargar backup antes de cada publicación automática
-        </label>
-
-        <div style="font-size:11.5px;color:var(--muted);line-height:1.7;padding-top:8px;border-top:1px solid var(--border-soft)">
-          <div>Umbral de cambios: <b style="color:var(--silver-light)">5 cambios</b></div>
-          <div>Umbral de tiempo: <b style="color:var(--silver-light)">60 segundos</b> sin editar</div>
-          <div style="margin-top:6px">Cambios pendientes: <b style="color:${sync.changeCount > 0 ? 'var(--gold)' : 'var(--silver-light)'}">${sync.changeCount}</b></div>
+        <div style="font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:10px">ESTADO</div>
+        <div style="font-size:11.5px;color:var(--muted);line-height:1.7">
+          <div>Cambios pendientes: <b style="color:${sync.dirtyCount > 0 ? 'var(--gold)' : 'var(--silver-light)'}">${sync.dirtyCount}</b></div>
+          <div>Último push: <b style="color:var(--silver-light)">${sync.lastPushAt ? new Date(sync.lastPushAt).toLocaleString() : 'Nunca'}</b></div>
+          <div>Conexión: <b style="color:${navigator.onLine ? 'var(--success)' : 'var(--danger)'}">${navigator.onLine ? 'Online' : 'Offline'}</b></div>
         </div>
       </div>
     </div>
@@ -977,14 +992,14 @@ export function bindConfigEvents(){
 
   const db = getDB();
 
-  // ─── AUTH + PUBLICAR ───
+  // AUTH + SYNC
   document.getElementById('btnLoginFromConfig')?.addEventListener('click', async () => {
     await refreshAuthState();
     if (!_authUser) openLoginModal();
   });
 
   document.getElementById('btnLogout')?.addEventListener('click', async () => {
-    if (!confirm('¿Cerrar sesión de Supabase?')) return;
+    if (!confirm('¿Cerrar sesión?')) return;
     try {
       await logout();
       _authUser = null;
@@ -994,36 +1009,28 @@ export function bindConfigEvents(){
       const ai = dbCurr.config.ai || {};
       document.getElementById('configContent').innerHTML = renderConfigTab(configTab, dbCurr, ai);
       bindConfigEvents();
-    } catch(e) {
-      toast('Error: ' + e.message, 'error');
-    }
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
   });
 
-  document.getElementById('btnPublishFromConfig')?.addEventListener('click', () => {
-    openPublishModal();
+  document.getElementById('btnForcePull')?.addEventListener('click', async () => {
+    try {
+      toast('Descargando del servidor...', 'info');
+      await forcePull();
+      toast('Datos descargados', 'success');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
   });
+
+  document.getElementById('btnForcePush')?.addEventListener('click', () => openPublishModal());
 
   document.getElementById('btnTestConn')?.addEventListener('click', async () => {
     try {
       await testConnection();
-      toast('✅ Conexión a Supabase correcta', 'success');
-    } catch(e) {
-      toast('❌ Error: ' + e.message, 'error');
-    }
+      toast('✅ Conexión correcta', 'success');
+    } catch(e) { toast('❌ ' + e.message, 'error'); }
   });
 
-  // ─── AUTO-SYNC TOGGLES ───
-  document.getElementById('autoSyncToggle')?.addEventListener('change', (e) => {
-    setAutoSyncEnabled(e.target.checked);
-    toast(`Auto-sync ${e.target.checked ? 'activado' : 'desactivado'}`, 'success');
-  });
-
-  document.getElementById('backupBeforeToggle')?.addEventListener('change', (e) => {
-    setBackupEnabled(e.target.checked);
-    toast(`Backup automático ${e.target.checked ? 'activado' : 'desactivado'}`, 'success');
-  });
-
-  // ─── GENERAL ───
+  // GENERAL
   document.getElementById('saveCfgGeneral')?.addEventListener('click', () => {
     const q = id => document.getElementById(id);
     mutate(d => {
@@ -1053,7 +1060,7 @@ export function bindConfigEvents(){
     }));
 
   document.getElementById('resetWidgetsBtn')?.addEventListener('click', () => {
-    if(!confirm('¿Restaurar la lista de widgets a los valores por defecto? Se perderán las copias.')) return;
+    if(!confirm('¿Restaurar widgets por defecto?')) return;
     mutate(d => { d.widgets = getDefaultWidgets(); });
     toast('Widgets restaurados','success');
     window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -1126,7 +1133,7 @@ export function bindConfigEvents(){
   });
   document.querySelectorAll('[data-div-del]').forEach(btn => {
     btn.addEventListener('click', () => {
-      if(!confirm('¿Eliminar esta división? Debe estar vacía.')) return;
+      if(!confirm('¿Eliminar esta división?')) return;
       try {
         deleteDivision(btn.dataset.divDel);
         toast('División eliminada','success');
@@ -1205,7 +1212,7 @@ export function bindConfigEvents(){
       const select = document.getElementById('aiModel');
       const current = select.value;
       select.innerHTML = models.map(m => `<option value="${m}" ${m===current?'selected':''}>${m}</option>`).join('');
-      status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--success)">✅ ${models.length} modelos disponibles.</div>`;
+      status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--success)">✅ ${models.length} modelos</div>`;
     } catch(e){
       status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--danger)">❌ ${e.message}</div>`;
     }
@@ -1241,7 +1248,7 @@ export function bindConfigEvents(){
     btn.disabled = true; btn.textContent = 'PROBANDO...';
     try {
       const res = await AIService.testConnection();
-      status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--success)">✅ Conexión OK · ${res.models.length} modelos disponibles</div>`;
+      status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--success)">✅ OK · ${res.models.length} modelos</div>`;
     } catch(e){
       status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--danger)">❌ ${e.message}</div>`;
     } finally {
@@ -1249,7 +1256,7 @@ export function bindConfigEvents(){
     }
   });
 
-  document.getElementById('btnExport')?.addEventListener('click', () => { exportJSON(); toast('Base de datos exportada','success'); });
+  document.getElementById('btnExport')?.addEventListener('click', () => { exportJSON(); toast('Exportado','success'); });
   document.getElementById('btnBackup')?.addEventListener('click', () => { exportBackup(); toast('Backup exportado','success'); });
   document.getElementById('btnImport')?.addEventListener('change', async e => {
     const f = e.target.files[0]; if(!f) return;
@@ -1257,10 +1264,10 @@ export function bindConfigEvents(){
       await importJSON(f);
       toast('Datos importados','success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
-    } catch(err){ toast('Error al importar: '+err.message,'error'); }
+    } catch(err){ toast('Error: '+err.message,'error'); }
   });
   document.getElementById('btnReset')?.addEventListener('click', () => {
-    if(!confirm('¿Restaurar base de datos a valores por defecto?')) return;
+    if(!confirm('¿Restaurar base de datos por defecto?')) return;
     resetDB();
     toast('Base restaurada','success');
     window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -1268,12 +1275,11 @@ export function bindConfigEvents(){
 }
 
 // ============================================================
-// FLUJO FIN DE TEMPORADA
+// FIN DE TEMPORADA
 // ============================================================
 function openSeasonEndWarning(){
   let countdown = 5;
   let intervalId = null;
-
   openModal({
     id: 'season-end-warning',
     title: '⚠ TERMINAR TEMPORADA',
@@ -1281,8 +1287,8 @@ function openSeasonEndWarning(){
       <div style="text-align:center;padding:8px 0 16px">
         <div style="font-size:52px;margin-bottom:12px">🏆</div>
         <h3 style="font-family:var(--font-display);letter-spacing:.14em;color:var(--silver-light);font-size:18px;margin-bottom:12px">¿TERMINAR LA TEMPORADA ACTUAL?</h3>
-        <p style="color:var(--silver);font-size:13px;line-height:1.7;margin-bottom:16px">
-          Esta acción archivará la temporada actual y creará una nueva.<br>
+        <p style="color:var(--silver);font-size:13px;line-height:1.7">
+          Se archivará la temporada actual y se creará una nueva.<br>
           <strong style="color:var(--gold)">No se puede deshacer.</strong>
         </p>
       </div>
@@ -1295,13 +1301,8 @@ function openSeasonEndWarning(){
       const btn = root.querySelector('#seasonEndConfirm');
       intervalId = setInterval(() => {
         countdown--;
-        if(countdown <= 0){
-          clearInterval(intervalId); intervalId = null;
-          btn.disabled = false;
-          btn.textContent = 'CONFIRMAR';
-        } else {
-          btn.textContent = `ESPERA (${countdown}s)`;
-        }
+        if(countdown <= 0){ clearInterval(intervalId); intervalId = null; btn.disabled = false; btn.textContent = 'CONFIRMAR'; }
+        else btn.textContent = `ESPERA (${countdown}s)`;
       }, 1000);
       btn.addEventListener('click', () => {
         if(intervalId){ clearInterval(intervalId); intervalId = null; }
@@ -1385,12 +1386,12 @@ function openSeasonEndCheck(){
       ` : ''}
       <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--silver-light);cursor:pointer;padding:12px;background:var(--bg-graphite);border:1px solid var(--border-soft);border-radius:8px">
         <input type="checkbox" id="seasonEndAutoTrophies" ${autoTrophies ? 'checked' : ''}>
-        🏆 Asignar trofeos automáticamente a campeones, ascendidos y sus jugadores
+        🏆 Asignar trofeos automáticamente
       </label>
     `,
     footer: `
       <button class="btn btn-ghost" data-close>CANCELAR</button>
-      <button class="btn btn-primary" id="seasonEndExecute" style="background:var(--gold);color:#04101F;border-color:var(--gold);font-weight:700">✅ CONFIRMAR Y TERMINAR</button>
+      <button class="btn btn-primary" id="seasonEndExecute" style="background:var(--gold);color:#04101F;border-color:var(--gold);font-weight:700">✅ CONFIRMAR</button>
     `,
     onMount: root => {
       root.querySelector('#seasonEndExecute').addEventListener('click', () => {
@@ -1398,7 +1399,7 @@ function openSeasonEndCheck(){
           const autoT = root.querySelector('#seasonEndAutoTrophies').checked;
           const result = finishSeason({ autoAssignTrophies: autoT });
           closeTopModal();
-          toast(`✅ ${result.archivedSeasonName} archivada. Ahora estás en ${result.newSeasonName}.`, 'success');
+          toast(`✅ ${result.archivedSeasonName} archivada. Ahora ${result.newSeasonName}.`, 'success');
           setTimeout(() => window.dispatchEvent(new HashChangeEvent('hashchange')), 300);
         } catch(e){ toast('Error: ' + e.message, 'error'); }
       });
@@ -1422,9 +1423,7 @@ function saveZonesConfig(db){
     if(!current || current.type !== a.type){
       if(current) ranges.push(current);
       current = { from: a.pos, to: a.pos, type: a.type, color: defaultColors[a.type] || 'transparent' };
-    } else {
-      current.to = a.pos;
-    }
+    } else current.to = a.pos;
   });
   if(current) ranges.push(current);
 
