@@ -111,7 +111,7 @@ export function openLoginModal(){
     title: 'INICIAR SESIÓN',
     body: `
       <p style="font-size:12px;color:var(--muted);margin-bottom:14px;line-height:1.6">
-        Inicia sesión con tu cuenta de Supabase. Al hacer login, se descargarán automáticamente
+        Inicia sesión con tu cuenta de Supabase. Al hacer login se descargarán automáticamente
         los datos más recientes del servidor.
       </p>
       <div class="field">
@@ -146,29 +146,42 @@ export function openLoginModal(){
         try {
           const user = await login(email, pass);
           _authUser = user;
-          errEl.innerHTML = '<div style="color:var(--accent);font-size:12px">Descargando datos del servidor...</div>';
+          errEl.innerHTML = '';
           toast(`Bienvenido, ${user.email}`, 'success');
-
-          // Descargar datos
-          try {
-            const remoteDB = await downloadAll();
-            const localRaw = getDB();
-            const merged = {
-              ...remoteDB,
-              widgets: localRaw?.widgets || remoteDB.widgets,
-              viewSeasonId: localRaw?.viewSeasonId || null
-            };
-            const { setRawDB } = await import('../services/storage.js');
-            setRawDB(merged);
-            toast('Datos descargados', 'success');
-            window.dispatchEvent(new HashChangeEvent('hashchange'));
-          } catch(dlErr) {
-            console.warn('[CONFIG] Descarga inicial falló:', dlErr);
-            toast('Login OK. Descarga inicial falló: ' + dlErr.message, 'error');
-          }
-
           closeTopModal();
           updateTopbarPublishButton();
+
+          // ✅ NUEVO: Descarga automática al login (con manejo de dirty)
+          // Resetear flag para forzar descarga tras login manual
+          window.__zenithHasDownloadedThisSession = false;
+
+          if (typeof window.__zenithPerformInitialDownload === 'function') {
+            await window.__zenithPerformInitialDownload({ reason: 'login' });
+          } else {
+            // Fallback: descarga directa
+            try {
+              const remoteDB = await downloadAll();
+              const { getRawDB, setRawDB } = await import('../services/storage.js');
+              const localRaw = getRawDB();
+              setRawDB({
+                ...remoteDB,
+                viewSeasonId: localRaw?.viewSeasonId || null
+              });
+              window.__zenithHasDownloadedThisSession = true;
+              window.dispatchEvent(new HashChangeEvent('hashchange'));
+            } catch(dlErr) {
+              console.warn('[CONFIG] Descarga tras login falló:', dlErr);
+              toast('Login OK. Descarga inicial falló: ' + dlErr.message, 'error');
+            }
+          }
+
+          // Re-render tab de datos si estábamos ahí
+          if (configTab === 'data') {
+            const dbCurr = getDB();
+            const ai = dbCurr.config.ai || {};
+            document.getElementById('configContent').innerHTML = renderConfigTab(configTab, dbCurr, ai);
+            bindConfigEvents();
+          }
         } catch(e) {
           errEl.innerHTML = `<div style="color:var(--danger);font-size:12px">${e.message}</div>`;
           btn.disabled = false;
@@ -196,13 +209,12 @@ export function openPublishModal(){
     wide: true,
     body: `
       <p style="font-size:13px;color:var(--silver);line-height:1.7;margin-bottom:16px">
-        Se subirán <b>todos los datos actuales</b> al servidor. Esto reemplaza
-        lo que estaba publicado previamente.
+        Se subirán <b>todos los datos actuales</b> al servidor.
       </p>
       <p style="font-size:12px;color:var(--gold);background:rgba(230,196,118,.08);
                 border:1px solid rgba(230,196,118,.3);border-radius:6px;padding:10px;line-height:1.6;margin-bottom:16px">
-        ⚠ <b>Nota:</b> En el modo tiempo real híbrido, los cambios ya se publican automáticamente
-        (con 2s de debounce). Este botón solo fuerza un push inmediato de TODAS las tablas.
+        ⚠ <b>Nota:</b> En modo tiempo real, los cambios ya se publican automáticamente (2s debounce).
+        Este botón solo fuerza un push inmediato de TODAS las tablas.
       </p>
 
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px">
@@ -268,7 +280,7 @@ export function openPublishModal(){
 export function configView(){
   const db = getDB();
 
-  if(db.viewSeasonId){
+  if (db.viewSeasonId) {
     const arch = (db.archivedSeasons || []).find(s => s.id === db.viewSeasonId);
     return `
       <h1 class="page-title" style="margin-bottom:20px">CONFIGURACIÓN</h1>
@@ -429,7 +441,7 @@ function renderGeneral(db){
 function renderZones(db){
   const activeDivisionId = state.divisionId || db.divisions[0]?.id;
   const division = db.divisions.find(d => d.id === activeDivisionId);
-  if(!division) return `<div class="card">Sin divisiones activas.</div>`;
+  if (!division) return `<div class="card">Sin divisiones activas.</div>`;
   const seasonId = db.seasons.find(s => s.active)?.id || db.seasons[0]?.id;
   const standings = computeStandings(activeDivisionId, seasonId);
   const zones = division.config.zones || { zones:[] };
@@ -654,40 +666,40 @@ function renderTrophiesConfig(db){
 
 function bindTrophiesConfig(){
   document.querySelectorAll('[data-trophy-upload]').forEach(btn => {
-    if(btn.dataset.bound) return;
+    if (btn.dataset.bound) return;
     btn.dataset.bound = '1';
     btn.addEventListener('click', () => document.querySelector(`[data-trophy-file="${btn.dataset.trophyUpload}"]`)?.click());
   });
   document.querySelectorAll('[data-trophy-file]').forEach(input => {
-    if(input.dataset.bound) return;
+    if (input.dataset.bound) return;
     input.dataset.bound = '1';
     input.addEventListener('change', async () => {
-      const f = input.files[0]; if(!f) return;
+      const f = input.files[0]; if (!f) return;
       const key = input.dataset.trophyFile;
       try {
         const dataUrl = await compressImage(f, 128, 128);
         document.querySelector(`[data-trophy-image="${key}"]`).value = dataUrl;
         document.querySelector(`[data-preview="${key}"]`).innerHTML = `<img src="${dataUrl}" style="width:100%;height:100%;object-fit:contain">`;
         toast('Imagen cargada (guarda para confirmar)', 'success');
-      } catch(e){ toast('Error procesando imagen', 'error'); }
+      } catch(e) { toast('Error procesando imagen', 'error'); }
     });
   });
 
   const bannerUpload = document.getElementById('banner-upload');
   const bannerBtn = document.getElementById('banner-btn');
-  if(bannerBtn && !bannerBtn.dataset.bound){
+  if (bannerBtn && !bannerBtn.dataset.bound) {
     bannerBtn.dataset.bound = '1';
     bannerBtn.addEventListener('click', () => bannerUpload?.click());
   }
-  if(bannerUpload && !bannerUpload.dataset.bound){
+  if (bannerUpload && !bannerUpload.dataset.bound) {
     bannerUpload.dataset.bound = '1';
     bannerUpload.addEventListener('change', async () => {
-      const f = bannerUpload.files[0]; if(!f) return;
+      const f = bannerUpload.files[0]; if (!f) return;
       try {
         const dataUrl = await compressImage(f, 1200, 500);
         document.getElementById('banner-data').value = dataUrl;
         toast('Banner cargado (guarda para confirmar)', 'success');
-      } catch(e){ toast('Error procesando banner', 'error'); }
+      } catch(e) { toast('Error procesando banner', 'error'); }
     });
   }
 
@@ -706,21 +718,21 @@ function bindTrophiesConfig(){
 
   function updatePreview(){
     const val = trophySel?.value;
-    if(val === '__custom'){
-      if(customFields) customFields.style.display = 'flex';
-      if(previewBox) previewBox.style.display = customName.value.trim() ? 'flex' : 'none';
-      if(previewName) previewName.textContent = customName.value.trim() || '—';
-      if(previewImg) previewImg.innerHTML = currentCustomImage ? `<img src="${currentCustomImage}" style="width:100%;height:100%;object-fit:contain">` : '🏆';
+    if (val === '__custom') {
+      if (customFields) customFields.style.display = 'flex';
+      if (previewBox) previewBox.style.display = customName.value.trim() ? 'flex' : 'none';
+      if (previewName) previewName.textContent = customName.value.trim() || '—';
+      if (previewImg) previewImg.innerHTML = currentCustomImage ? `<img src="${currentCustomImage}" style="width:100%;height:100%;object-fit:contain">` : '🏆';
     } else {
-      if(customFields) customFields.style.display = 'none';
+      if (customFields) customFields.style.display = 'none';
       const opt = trophySel?.selectedOptions[0];
-      if(opt && opt.value){
-        if(previewBox) previewBox.style.display = 'flex';
-        if(previewName) previewName.textContent = opt.textContent;
+      if (opt && opt.value) {
+        if (previewBox) previewBox.style.display = 'flex';
+        if (previewName) previewName.textContent = opt.textContent;
         const existing = listExistingTrophies().find(t => `existing:${t.key}` === val);
-        if(previewImg) previewImg.innerHTML = existing?.image ? `<img src="${existing.image}" style="width:100%;height:100%;object-fit:contain">` : '🏆';
+        if (previewImg) previewImg.innerHTML = existing?.image ? `<img src="${existing.image}" style="width:100%;height:100%;object-fit:contain">` : '🏆';
       } else {
-        if(previewBox) previewBox.style.display = 'none';
+        if (previewBox) previewBox.style.display = 'none';
       }
     }
   }
@@ -731,33 +743,33 @@ function bindTrophiesConfig(){
 
   customUpload?.addEventListener('click', () => customFile?.click());
   customFile?.addEventListener('change', async () => {
-    const f = customFile.files[0]; if(!f) return;
+    const f = customFile.files[0]; if (!f) return;
     try {
       const res = await compressImage(f, 128, 128);
       currentCustomImage = res;
       customImgInput.value = res;
       updatePreview();
-    } catch(e){ toast('Error procesando imagen', 'error'); }
+    } catch(e) { toast('Error procesando imagen', 'error'); }
   });
 
   const giveBtn = document.getElementById('manual-give');
-  if(giveBtn && !giveBtn.dataset.bound){
+  if (giveBtn && !giveBtn.dataset.bound) {
     giveBtn.dataset.bound = '1';
     giveBtn.addEventListener('click', () => {
       try {
         const target = targetSel.value;
-        if(!target) return toast('Selecciona un destino', 'error');
+        if (!target) return toast('Selecciona un destino', 'error');
 
         const trophyVal = trophySel.value;
         let trophyData;
 
-        if(trophyVal === '__custom'){
+        if (trophyVal === '__custom') {
           const name = customName.value.trim();
-          if(!name) return toast('Falta el nombre del trofeo', 'error');
+          if (!name) return toast('Falta el nombre del trofeo', 'error');
           trophyData = { name, image: currentCustomImage || '', manual: true };
         } else {
           const existing = listExistingTrophies().find(t => `existing:${t.key}` === trophyVal);
-          if(!existing) return toast('Trofeo no encontrado', 'error');
+          if (!existing) return toast('Trofeo no encontrado', 'error');
           trophyData = {
             name: existing.name, image: existing.image, manual: true,
             divisionId: existing.divisionId, divisionName: existing.divisionName, type: existing.type
@@ -766,7 +778,7 @@ function bindTrophiesConfig(){
         trophyData.date = Date.now();
 
         const [kind, id] = target.split(':');
-        if(kind === 'team'){
+        if (kind === 'team') {
           assignTrophyToTeam(id, trophyData);
           toast(`Trofeo "${trophyData.name}" asignado al equipo`, 'success');
         } else {
@@ -774,7 +786,7 @@ function bindTrophiesConfig(){
           toast(`Trofeo "${trophyData.name}" asignado al jugador`, 'success');
         }
         window.dispatchEvent(new HashChangeEvent('hashchange'));
-      } catch(e){
+      } catch(e) {
         console.error(e);
         toast('Error: ' + e.message, 'error');
       }
@@ -786,9 +798,9 @@ function bindTrophiesConfig(){
   const remBtn = document.getElementById('remove-trophy-btn');
 
   function refreshRemoveList(){
-    if(!remTarget || !remSelect || !remBtn) return;
+    if (!remTarget || !remSelect || !remBtn) return;
     const val = remTarget.value;
-    if(!val){
+    if (!val) {
       remSelect.innerHTML = '<option value="">— Selecciona un destino —</option>';
       remBtn.disabled = true;
       return;
@@ -796,14 +808,14 @@ function bindTrophiesConfig(){
     const [kind, id] = val.split(':');
     const db = getDB();
     let list = [];
-    if(kind === 'team'){
+    if (kind === 'team') {
       const t = db.teams.find(x => x.id === id);
       list = t?.trophies || [];
     } else {
       const p = db.players.find(x => x.id === id);
       list = p?.trophies || [];
     }
-    if(list.length === 0){
+    if (list.length === 0) {
       remSelect.innerHTML = '<option value="">— Sin trofeos —</option>';
       remBtn.disabled = true;
       return;
@@ -817,20 +829,20 @@ function bindTrophiesConfig(){
   remBtn?.addEventListener('click', () => {
     const val = remTarget.value;
     const trophyId = remSelect.value;
-    if(!val || !trophyId) return;
-    if(!confirm('¿Quitar este trofeo?')) return;
+    if (!val || !trophyId) return;
+    if (!confirm('¿Quitar este trofeo?')) return;
     try {
       const [kind, id] = val.split(':');
-      if(kind === 'team') removeTrophyFromTeam(id, trophyId);
+      if (kind === 'team') removeTrophyFromTeam(id, trophyId);
       else removeTrophyFromPlayer(id, trophyId);
       toast('Trofeo eliminado', 'success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
-    } catch(e){ toast('Error: ' + e.message, 'error'); }
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
   });
   refreshRemoveList();
 
   const saveBtn = document.getElementById('save-trophies');
-  if(saveBtn && !saveBtn.dataset.bound){
+  if (saveBtn && !saveBtn.dataset.bound) {
     saveBtn.dataset.bound = '1';
     saveBtn.addEventListener('click', () => {
       try {
@@ -843,7 +855,7 @@ function bindTrophiesConfig(){
           d.trophies ||= {};
           Object.keys(names).forEach(key => {
             const [divId, type] = key.split('::');
-            if(!divId || !type) return;
+            if (!divId || !type) return;
             d.trophies[divId] ||= {};
             d.trophies[divId][type] ||= {};
             d.trophies[divId][type].name = names[key] || '';
@@ -852,7 +864,7 @@ function bindTrophiesConfig(){
           d.transferBannerBg = banner;
         });
         toast('Configuración de trofeos guardada', 'success');
-      } catch(e){
+      } catch(e) {
         console.error(e);
         toast('Error: ' + e.message, 'error');
       }
@@ -912,6 +924,7 @@ function renderAI(ai){
 function renderData(){
   const sync = getSyncState();
   const loggedIn = !!_authUser;
+  const hasDownloaded = window.__zenithHasDownloadedThisSession;
 
   return `
     <div class="card" style="border-left:4px solid var(--accent);margin-bottom:20px">
@@ -923,15 +936,18 @@ function renderData(){
       </div>
 
       <p style="font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:16px">
-        Los cambios en <b style="color:var(--silver-light)">equipos, jugadores, partidos y noticias</b>
-        se sincronizan automáticamente con el servidor (2s de debounce).
-        Los cambios en configuración y temporadas requieren push manual.
+        Los cambios en <b style="color:var(--silver-light)">equipos, jugadores, partidos, noticias</b>,
+        <b style="color:var(--silver-light)">widgets</b>, <b style="color:var(--silver-light)">trofeos</b> y
+        <b style="color:var(--silver-light)">configuración</b> se sincronizan automáticamente (2s debounce).
       </p>
 
       <div style="background:var(--bg-graphite);border:1px solid var(--border-soft);border-radius:8px;padding:12px;margin-bottom:16px">
         <div style="font-size:11px;color:var(--muted);letter-spacing:.14em;margin-bottom:6px">CUENTA</div>
         ${loggedIn
           ? `<div style="font-size:13px;color:var(--silver-light);margin-bottom:10px">${esc(_authUser.email)}</div>
+             <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+               ${hasDownloaded ? '✅ Datos descargados en esta sesión' : '⏳ Pendiente de descarga inicial'}
+             </div>
              <div style="display:flex;gap:8px;flex-wrap:wrap">
                <button class="btn btn-sm" id="btnForcePull">⬇ DESCARGAR DEL SERVIDOR</button>
                <button class="btn btn-sm" id="btnForcePush">☁ FORZAR PUBLICACIÓN</button>
@@ -969,7 +985,7 @@ function renderData(){
 // ============================================================
 export function bindConfigEvents(){
   const exitBtn = document.getElementById('btnExitViewFromConfig');
-  if(exitBtn){
+  if (exitBtn) {
     exitBtn.addEventListener('click', () => {
       import('../services/seasons.js').then(({ switchToSeason }) => {
         switchToSeason(null);
@@ -982,7 +998,7 @@ export function bindConfigEvents(){
   document.querySelectorAll('[data-config-tab]').forEach(btn => {
     btn.addEventListener('click', () => {
       configTab = btn.dataset.configTab;
-      document.querySelectorAll('[data-config-tab]').forEach(b => b.classList.toggle('active', b===btn));
+      document.querySelectorAll('[data-config-tab]').forEach(b => b.classList.toggle('active', b === btn));
       const db = getDB();
       const ai = db.config.ai || {};
       document.getElementById('configContent').innerHTML = renderConfigTab(configTab, db, ai);
@@ -1018,6 +1034,10 @@ export function bindConfigEvents(){
       await forcePull();
       toast('Datos descargados', 'success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
+      const dbCurr = getDB();
+      const ai = dbCurr.config.ai || {};
+      document.getElementById('configContent').innerHTML = renderConfigTab(configTab, dbCurr, ai);
+      bindConfigEvents();
     } catch(e) { toast('Error: ' + e.message, 'error'); }
   });
 
@@ -1046,21 +1066,21 @@ export function bindConfigEvents(){
     cb.addEventListener('change', () => {
       mutate(d => {
         const w = d.widgets.find(x => x.instanceId === cb.dataset.widgetToggle);
-        if(w) w.enabled = cb.checked;
+        if (w) w.enabled = cb.checked;
       });
       toast('Widget actualizado','success');
     }));
 
   document.querySelectorAll('[data-widget-remove]').forEach(btn =>
     btn.addEventListener('click', () => {
-      if(!confirm('¿Eliminar esta instancia del widget?')) return;
+      if (!confirm('¿Eliminar esta instancia del widget?')) return;
       mutate(d => { d.widgets = d.widgets.filter(w => w.instanceId !== btn.dataset.widgetRemove); });
       toast('Widget eliminado','success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
     }));
 
   document.getElementById('resetWidgetsBtn')?.addEventListener('click', () => {
-    if(!confirm('¿Restaurar widgets por defecto?')) return;
+    if (!confirm('¿Restaurar widgets por defecto?')) return;
     mutate(d => { d.widgets = getDefaultWidgets(); });
     toast('Widgets restaurados','success');
     window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -1068,19 +1088,19 @@ export function bindConfigEvents(){
 
   document.getElementById('btnFinishSeason')?.addEventListener('click', () => {
     const currentDB = getDB();
-    if(currentDB.viewSeasonId) return toast('📖 Estás en modo lectura.', 'error');
+    if (currentDB.viewSeasonId) return toast('📖 Estás en modo lectura.', 'error');
     openSeasonEndWarning();
   });
 
   document.getElementById('btnResetDivisions')?.addEventListener('click', () => {
     const currentDB = getDB();
-    if(currentDB.viewSeasonId) return toast('📖 Estás en modo lectura.', 'error');
-    if(!confirm('⚠️ ¿Resetear todas las divisiones?')) return;
+    if (currentDB.viewSeasonId) return toast('📖 Estás en modo lectura.', 'error');
+    if (!confirm('⚠️ ¿Resetear todas las divisiones?')) return;
     try {
       resetDivisions();
       toast('Divisiones reseteadas', 'success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
-    } catch(e){ toast('Error: ' + e.message, 'error'); }
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
   });
 
   document.getElementById('saveZones')?.addEventListener('click', () => {
@@ -1090,11 +1110,11 @@ export function bindConfigEvents(){
     window.dispatchEvent(new HashChangeEvent('hashchange'));
   });
   document.getElementById('resetZones')?.addEventListener('click', () => {
-    if(!confirm('¿Restaurar clasificaciones por defecto?')) return;
+    if (!confirm('¿Restaurar clasificaciones por defecto?')) return;
     import('../data/database.js').then(({DEFAULT_ZONES}) => {
       mutate(d => {
         const div = d.divisions.find(x => x.id === (state.divisionId || d.divisions[0].id));
-        if(div) div.config.zones = JSON.parse(JSON.stringify(DEFAULT_ZONES));
+        if (div) div.config.zones = JSON.parse(JSON.stringify(DEFAULT_ZONES));
       });
       toast('Zonas restauradas','success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -1118,7 +1138,7 @@ export function bindConfigEvents(){
             toast('División creada','success');
             closeTopModal();
             window.dispatchEvent(new HashChangeEvent('hashchange'));
-          } catch(e){ toast(e.message,'error'); }
+          } catch(e) { toast(e.message,'error'); }
         });
       }
     });
@@ -1133,18 +1153,18 @@ export function bindConfigEvents(){
   });
   document.querySelectorAll('[data-div-del]').forEach(btn => {
     btn.addEventListener('click', () => {
-      if(!confirm('¿Eliminar esta división?')) return;
+      if (!confirm('¿Eliminar esta división?')) return;
       try {
         deleteDivision(btn.dataset.divDel);
         toast('División eliminada','success');
         window.dispatchEvent(new HashChangeEvent('hashchange'));
-      } catch(e){ toast(e.message,'error'); }
+      } catch(e) { toast(e.message,'error'); }
     });
   });
   document.querySelectorAll('[data-div-edit]').forEach(btn => {
     btn.addEventListener('click', () => {
       const div = db.divisions.find(d => d.id === btn.dataset.divEdit);
-      if(!div) return;
+      if (!div) return;
       openModal({
         id: 'edit-division-' + div.id, title: 'EDITAR DIVISIÓN',
         body: `
@@ -1169,11 +1189,11 @@ export function bindConfigEvents(){
 
   document.getElementById('movType')?.addEventListener('change', e => {
     const wrap = document.getElementById('movSwapWrap');
-    if(wrap) wrap.style.display = e.target.value === 'swap' ? '' : 'none';
+    if (wrap) wrap.style.display = e.target.value === 'swap' ? '' : 'none';
   });
   document.getElementById('movApplyAt')?.addEventListener('change', e => {
     const wrap = document.getElementById('movRoundWrap');
-    if(wrap) wrap.style.display = e.target.value === 'roundN' ? '' : 'none';
+    if (wrap) wrap.style.display = e.target.value === 'roundN' ? '' : 'none';
   });
   document.getElementById('btnQueueMovement')?.addEventListener('click', () => {
     const type = document.getElementById('movType').value;
@@ -1184,18 +1204,18 @@ export function bindConfigEvents(){
     const round = applyAt === 'roundN' ? +document.getElementById('movRound').value : null;
     const reason = document.getElementById('movReason').value.trim();
     try {
-      if(type === 'swap'){
-        if(!teamB) throw new Error('Selecciona ambos equipos');
+      if (type === 'swap') {
+        if (!teamB) throw new Error('Selecciona ambos equipos');
         swapTeams(teamA, teamB, applyAt, round);
       } else {
         queueTeamMovement({ teamId: teamA, targetDivisionId: targetDiv, type, applyAt, roundNumber: round, reason });
       }
       toast('Movimiento aplicado','success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
-    } catch(e){ toast(e.message,'error'); }
+    } catch(e) { toast(e.message,'error'); }
   });
 
-  if(configTab === 'trophies') bindTrophiesConfig();
+  if (configTab === 'trophies') bindTrophiesConfig();
 
   document.getElementById('aiToggleKey')?.addEventListener('click', () => {
     const el = document.getElementById('aiKey');
@@ -1203,7 +1223,7 @@ export function bindConfigEvents(){
   });
   document.getElementById('aiListModels')?.addEventListener('click', async () => {
     const key = document.getElementById('aiKey').value.trim();
-    if(!key) return toast('Introduce la API key primero','error');
+    if (!key) return toast('Introduce la API key primero','error');
     const status = document.getElementById('aiStatus');
     status.innerHTML = '<div class="card" style="padding:12px;font-size:12px">Consultando modelos…</div>';
     try {
@@ -1213,14 +1233,14 @@ export function bindConfigEvents(){
       const current = select.value;
       select.innerHTML = models.map(m => `<option value="${m}" ${m===current?'selected':''}>${m}</option>`).join('');
       status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--success)">✅ ${models.length} modelos</div>`;
-    } catch(e){
+    } catch(e) {
       status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--danger)">❌ ${e.message}</div>`;
     }
   });
   document.getElementById('aiResetPrompt')?.addEventListener('click', () => {
-    if(!confirm('¿Restaurar el prompt por defecto?')) return;
+    if (!confirm('¿Restaurar el prompt por defecto?')) return;
     const ta = document.getElementById('aiPrompt');
-    if(ta) ta.value = DEFAULT_SYSTEM_PROMPT;
+    if (ta) ta.value = DEFAULT_SYSTEM_PROMPT;
     toast('Prompt restaurado','success');
   });
   document.getElementById('aiSave')?.addEventListener('click', () => {
@@ -1239,7 +1259,7 @@ export function bindConfigEvents(){
         };
       });
       toast('Configuración IA guardada','success');
-    } catch(e){ toast('Error: ' + e.message, 'error'); }
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
   });
   document.getElementById('aiTest')?.addEventListener('click', async () => {
     document.getElementById('aiSave').click();
@@ -1249,7 +1269,7 @@ export function bindConfigEvents(){
     try {
       const res = await AIService.testConnection();
       status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--success)">✅ OK · ${res.models.length} modelos</div>`;
-    } catch(e){
+    } catch(e) {
       status.innerHTML = `<div class="card" style="padding:12px;font-size:12px;color:var(--danger)">❌ ${e.message}</div>`;
     } finally {
       btn.disabled = false; btn.textContent = 'PROBAR CONEXIÓN';
@@ -1259,15 +1279,15 @@ export function bindConfigEvents(){
   document.getElementById('btnExport')?.addEventListener('click', () => { exportJSON(); toast('Exportado','success'); });
   document.getElementById('btnBackup')?.addEventListener('click', () => { exportBackup(); toast('Backup exportado','success'); });
   document.getElementById('btnImport')?.addEventListener('change', async e => {
-    const f = e.target.files[0]; if(!f) return;
+    const f = e.target.files[0]; if (!f) return;
     try {
       await importJSON(f);
       toast('Datos importados','success');
       window.dispatchEvent(new HashChangeEvent('hashchange'));
-    } catch(err){ toast('Error: '+err.message,'error'); }
+    } catch(err) { toast('Error: '+err.message,'error'); }
   });
   document.getElementById('btnReset')?.addEventListener('click', () => {
-    if(!confirm('¿Restaurar base de datos por defecto?')) return;
+    if (!confirm('¿Restaurar base de datos por defecto?')) return;
     resetDB();
     toast('Base restaurada','success');
     window.dispatchEvent(new HashChangeEvent('hashchange'));
@@ -1301,25 +1321,25 @@ function openSeasonEndWarning(){
       const btn = root.querySelector('#seasonEndConfirm');
       intervalId = setInterval(() => {
         countdown--;
-        if(countdown <= 0){ clearInterval(intervalId); intervalId = null; btn.disabled = false; btn.textContent = 'CONFIRMAR'; }
+        if (countdown <= 0) { clearInterval(intervalId); intervalId = null; btn.disabled = false; btn.textContent = 'CONFIRMAR'; }
         else btn.textContent = `ESPERA (${countdown}s)`;
       }, 1000);
       btn.addEventListener('click', () => {
-        if(intervalId){ clearInterval(intervalId); intervalId = null; }
+        if (intervalId) { clearInterval(intervalId); intervalId = null; }
         closeTopModal();
         setTimeout(() => openSeasonEndCheck(), 180);
       });
     },
-    onClose: () => { if(intervalId){ clearInterval(intervalId); intervalId = null; } }
+    onClose: () => { if (intervalId) { clearInterval(intervalId); intervalId = null; } }
   });
 }
 
 function openSeasonEndCheck(){
   let check;
   try { check = canFinishSeason(); }
-  catch(e){ toast('Error: ' + e.message, 'error'); return; }
+  catch(e) { toast('Error: ' + e.message, 'error'); return; }
 
-  if(!check.ok){
+  if (!check.ok) {
     openModal({
       id: 'season-end-errors',
       title: '❌ NO SE PUEDE TERMINAR',
@@ -1343,18 +1363,18 @@ function openSeasonEndCheck(){
   const movementsPreview = [];
   check.divisionStatus.forEach(status => {
     const div = db.divisions.find(d => d.id === status.divisionId);
-    if(!div) return;
+    if (!div) return;
     const cfg = div.config || {};
-    if(cfg.promotion?.enabled && cfg.promotion.spots > 0){
+    if (cfg.promotion?.enabled && cfg.promotion.spots > 0) {
       const superior = db.divisions.find(d => d.tier === div.tier - 1);
-      if(superior){
+      if (superior) {
         const st = computeStandings(div.id, check.seasonId);
         st.slice(0, cfg.promotion.spots).forEach(t => movementsPreview.push({ team: t.name, from: div.name, to: superior.name, type: 'ASCENSO' }));
       }
     }
-    if(cfg.relegation?.enabled && cfg.relegation.spots > 0){
+    if (cfg.relegation?.enabled && cfg.relegation.spots > 0) {
       const inferior = db.divisions.find(d => d.tier === div.tier + 1);
-      if(inferior){
+      if (inferior) {
         const st = computeStandings(div.id, check.seasonId);
         st.slice(-cfg.relegation.spots).forEach(t => movementsPreview.push({ team: t.name, from: div.name, to: inferior.name, type: 'DESCENSO' }));
       }
@@ -1401,7 +1421,7 @@ function openSeasonEndCheck(){
           closeTopModal();
           toast(`✅ ${result.archivedSeasonName} archivada. Ahora ${result.newSeasonName}.`, 'success');
           setTimeout(() => window.dispatchEvent(new HashChangeEvent('hashchange')), 300);
-        } catch(e){ toast('Error: ' + e.message, 'error'); }
+        } catch(e) { toast('Error: ' + e.message, 'error'); }
       });
     }
   });
@@ -1420,18 +1440,18 @@ function saveZonesConfig(db){
   let current = null;
   const defaultColors = Object.fromEntries(ZONE_TYPES.map(z => [z.id, z.color]));
   assignments.forEach(a => {
-    if(!current || current.type !== a.type){
-      if(current) ranges.push(current);
+    if (!current || current.type !== a.type) {
+      if (current) ranges.push(current);
       current = { from: a.pos, to: a.pos, type: a.type, color: defaultColors[a.type] || 'transparent' };
     } else current.to = a.pos;
   });
-  if(current) ranges.push(current);
+  if (current) ranges.push(current);
 
   const hasTop1Highlight = document.getElementById('zoneShowTop1').checked;
 
   mutate(d => {
     const div = d.divisions.find(x => x.id === activeDivisionId);
-    if(!div) return;
+    if (!div) return;
     div.config.zones = { hasTop1Highlight, zones: ranges };
 
     const playoffZone    = ranges.find(z => z.type === 'playoff');
