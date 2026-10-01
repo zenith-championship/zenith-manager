@@ -50,11 +50,6 @@ export function loadDB(){
 // ============================================================
 // SANITIZACIÓN
 // ============================================================
-function safeNum(v, def = 0){
-  if (typeof v !== 'number' || !isFinite(v)) return def;
-  return v;
-}
-
 function normalizePlayer(p){
   if(!p || typeof p !== 'object') return;
   if(p.rankLevel === undefined)        p.rankLevel = 2;
@@ -195,7 +190,6 @@ function migrate(db){
     if(!Array.isArray(m.games)) m.games = [];
   });
 
-  // Sincronizar team.seasonId con su división
   db.teams.forEach(t => {
     if(!t.divisionId) return;
     const div = db.divisions.find(d => d.id === t.divisionId);
@@ -204,7 +198,6 @@ function migrate(db){
     }
   });
 
-  // Equipos huérfanos → temporada activa
   const activeSeason = db.seasons.find(s => s.active) || db.seasons[0];
   if(activeSeason){
     const knownIds = new Set([
@@ -296,6 +289,13 @@ export function getDB(){
 
 export function getRawDB(){ return _db || loadDB(); }
 
+export function setRawDB(newDB){
+  _db = migrate(newDB);
+  _viewCache = null;
+  _viewCacheForId = null;
+  persist();
+}
+
 export function setViewSeasonId(id){
   if(!_db) loadDB();
   _db.viewSeasonId = id || null;
@@ -320,18 +320,6 @@ export function persist(){
   }
   catch(e){
     console.error('[ZENITH] Error persistiendo DB:', e);
-    try {
-      const seen = new WeakSet();
-      JSON.stringify(_db, (key, val) => {
-        if (typeof val === 'object' && val !== null) {
-          if (seen.has(val)) { console.error('[ZENITH] Ref circular en:', key); return '[Circular]'; }
-          seen.add(val);
-        }
-        if (typeof val === 'number' && !isFinite(val)) console.error('[ZENITH] NaN/Infinity en:', key);
-        if (typeof val === 'function') { console.error('[ZENITH] Función en:', key); return '[Fn]'; }
-        return val;
-      });
-    } catch(_){}
     const msg = e.name === 'QuotaExceededError'
       ? 'El almacenamiento local está lleno.'
       : 'La base de datos contiene datos no serializables.';
@@ -341,7 +329,7 @@ export function persist(){
 }
 
 // ============================================================
-// MUTATE — con hook de auto-sync
+// MUTATE — con hooks de sync
 // ============================================================
 export function mutate(fn){
   if(!_db) loadDB();
@@ -355,19 +343,24 @@ export function mutate(fn){
   try { snapshot = JSON.stringify(db); }
   catch(e){ console.error('[ZENITH] DB corrupta, no se puede snapshot:', e); }
 
+  // Capturar hashes ANTES
+  const oldHashes = window.__zenithCaptureHashes ? window.__zenithCaptureHashes() : null;
+
   try {
     fn(db);
     persist();
 
-    // ─── HOOK DE AUTO-SYNC ───
+    // Detectar cambios y notificar al sync
     try {
-      if (typeof window !== 'undefined' && window.__zenithNotifyChange) {
-        window.__zenithNotifyChange();
+      if (oldHashes && window.__zenithNotifyChange) {
+        const newHashes = window.__zenithCaptureHashes ? window.__zenithCaptureHashes() : null;
+        if (newHashes) {
+          window.__zenithNotifyChange(oldHashes, newHashes);
+        }
       }
     } catch(hookErr){
       console.warn('[ZENITH] Hook de sync falló:', hookErr);
     }
-    // ─────────────────────────
 
   } catch(e) {
     console.error('[ZENITH] Error en mutate, restaurando:', e);
@@ -430,3 +423,7 @@ export function resetDB(){
   _viewCacheForId = null;
   persist();
 }
+
+// Exponer al window para sync
+window.__zenithGetRawDB = getRawDB;
+window.__zenithSetRawDB = setRawDB;

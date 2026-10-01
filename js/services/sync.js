@@ -1,190 +1,256 @@
 // ============================================================
-// SYNC SERVICE — Auto-publicación con umbral doble + backups
+// SYNC SERVICE — Sincronización en tiempo real con Supabase
 // ============================================================
-import { getSupabase, publishToSupabase } from './supabase.js';
-import { getRawDB, exportBackup } from './storage.js';
+import { downloadAll, pushTables, subscribeRealtime, unsubscribeRealtime } from './supabase.js';
 
-const STORAGE_KEYS = {
-  CHANGES_COUNT: 'ZENITH_CHANGES_COUNT',
-  AUTO_SYNC_ENABLED: 'ZENITH_AUTO_SYNC_ENABLED',
-  BACKUP_BEFORE: 'ZENITH_BACKUP_BEFORE_PUBLISH',
-  LAST_PUBLISH: 'ZENITH_LAST_PUBLISH'
+// Tablas que se sincronizan en tiempo real (cambios frecuentes)
+const REALTIME_TABLES = new Set(['teams', 'players', 'matches', 'news']);
+
+// Mapeo de tabla → key en la DB local
+const TABLE_TO_KEY = {
+  seasons: 'seasons',
+  divisions: 'divisions',
+  teams: 'teams',
+  players: 'players',
+  matches: 'matches',
+  playoffs: 'playoffs',
+  news: 'news',
+  archived_seasons: 'archivedSeasons',
+  config: 'config'
 };
 
-const DEFAULTS = {
-  changesThreshold: 5,
-  secondsThreshold: 60,
-  enabled: false,
-  backupBefore: true
-};
+const PUSH_DEBOUNCE_MS = 2000;
+const REALTIME_COOLDOWN_MS = 3000;
 
-let _changeCount = 0;
-let _timer = null;
-let _publishing = false;
-let _lastFailureAt = 0;
+let _dirtyTables = new Set();
+let _pushTimer = null;
+let _isPushing = false;
+let _lastPushAt = 0;
+let _realtimeCooldownUntil = 0;
+let _initialized = false;
 
 // ============================================================
-// ESTADO
+// HELPERS
 // ============================================================
-export function getSyncState() {
-  return {
-    changeCount: _changeCount,
-    autoSyncEnabled: isAutoSyncEnabled(),
-    backupBefore: isBackupEnabled(),
-    lastPublish: getLastPublish(),
-    publishing: _publishing
-  };
+function hashString(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) + str.charCodeAt(i);
+    h = h & h; // 32-bit
+  }
+  return (h >>> 0).toString(36);
 }
 
-export function isAutoSyncEnabled() {
-  const v = localStorage.getItem(STORAGE_KEYS.AUTO_SYNC_ENABLED);
-  if (v === null) return DEFAULTS.enabled;
-  return v === 'true';
-}
-
-export function setAutoSyncEnabled(enabled) {
-  localStorage.setItem(STORAGE_KEYS.AUTO_SYNC_ENABLED, enabled ? 'true' : 'false');
-  if (enabled && _changeCount > 0) {
-    schedulePublish();
-  } else if (!enabled) {
-    cancelTimer();
+function hashTable(data) {
+  try {
+    return hashString(JSON.stringify(data ?? null));
+  } catch(_) {
+    return 'err';
   }
 }
 
-export function isBackupEnabled() {
-  const v = localStorage.getItem(STORAGE_KEYS.BACKUP_BEFORE);
-  if (v === null) return DEFAULTS.backupBefore;
-  return v === 'true';
+// ============================================================
+// DETECCIÓN DE CAMBIOS
+// ============================================================
+const _lastHashes = {};
+
+export function captureHashes(db) {
+  const newHashes = {};
+  Object.entries(TABLE_TO_KEY).forEach(([table, key]) => {
+    if (key === 'config') {
+      const cfg = {
+        config: db.config,
+        widgets: db.widgets,
+        trophies: db.trophies,
+        transferLog: db.transferLog,
+        transferBannerBg: db.transferBannerBg
+      };
+      newHashes[table] = hashTable(cfg);
+    } else {
+      newHashes[table] = hashTable(db[key]);
+    }
+  });
+  return newHashes;
 }
 
-export function setBackupEnabled(enabled) {
-  localStorage.setItem(STORAGE_KEYS.BACKUP_BEFORE, enabled ? 'true' : 'false');
-}
-
-export function getLastPublish() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.LAST_PUBLISH);
-    return raw ? JSON.parse(raw) : null;
-  } catch(_) { return null; }
-}
-
-function setLastPublish(info) {
-  localStorage.setItem(STORAGE_KEYS.LAST_PUBLISH, JSON.stringify(info));
-}
-
-function loadChangeCount() {
-  const v = parseInt(localStorage.getItem(STORAGE_KEYS.CHANGES_COUNT) || '0', 10);
-  _changeCount = isNaN(v) ? 0 : v;
-}
-
-function saveChangeCount() {
-  localStorage.setItem(STORAGE_KEYS.CHANGES_COUNT, String(_changeCount));
-}
-
-function resetChangeCount() {
-  _changeCount = 0;
-  saveChangeCount();
-}
-
-function cancelTimer() {
-  if (_timer) { clearTimeout(_timer); _timer = null; }
+function detectDirtyTables(oldHashes, newHashes) {
+  const dirty = [];
+  for (const table of Object.keys(newHashes)) {
+    if (oldHashes[table] !== newHashes[table]) {
+      dirty.push(table);
+    }
+  }
+  return dirty;
 }
 
 // ============================================================
-// HOOK: llamado por storage.mutate()
+// HOOK: Llamado por storage.mutate()
 // ============================================================
-export function notifyChange() {
-  loadChangeCount();
-  _changeCount++;
-  saveChangeCount();
+export function notifyChange(oldHashes, newHashes) {
+  const dirty = detectDirtyTables(oldHashes, newHashes);
+  dirty.forEach(t => _dirtyTables.add(t));
 
-  if (!isAutoSyncEnabled()) return;
+  if (dirty.length > 0) {
+    updateSyncChip('pending');
+    schedulePush();
+  }
+}
 
-  // Si el contador llegó al umbral → publicar YA
-  if (_changeCount >= DEFAULTS.changesThreshold) {
-    triggerPublish('threshold');
+function schedulePush() {
+  if (_pushTimer) clearTimeout(_pushTimer);
+  _pushTimer = setTimeout(() => {
+    doPush().catch(err => console.error('[SYNC] push error:', err));
+  }, PUSH_DEBOUNCE_MS);
+}
+
+async function doPush() {
+  if (_isPushing) return;
+  if (_dirtyTables.size === 0) return;
+  if (Date.now() < _realtimeCooldownUntil) {
+    // Esperar un poco más para no chocar con realtime
+    schedulePush();
     return;
   }
 
-  // Si no, programar por tiempo
-  schedulePublish();
-}
+  _isPushing = true;
+  updateSyncChip('syncing');
 
-function schedulePublish() {
-  cancelTimer();
-  _timer = setTimeout(() => {
-    if (_changeCount > 0) triggerPublish('time');
-  }, DEFAULTS.secondsThreshold * 1000);
-}
-
-async function triggerPublish(reason) {
-  if (_publishing) return;
-  if (Date.now() - _lastFailureAt < 30000) return; // cooldown tras fallo
-
-  cancelTimer();
-  _publishing = true;
+  const tablesToPush = [..._dirtyTables];
+  _dirtyTables.clear();
 
   try {
-    // 1. ¿Autenticado?
-    const sb = getSupabase();
-    const { data: { user } } = await sb.auth.getUser();
-    if (!user) {
-      console.warn('[SYNC] Auto-sync saltado: no autenticado');
-      _publishing = false;
-      return;
-    }
+    const result = await pushTables(tablesToPush);
+    if (!result.ok) throw new Error(result.error || 'Push failed');
 
-    // 2. ¿Modo lectura?
-    const db = getRawDB();
-    if (db?.viewSeasonId) {
-      console.warn('[SYNC] Auto-sync saltado: modo lectura activo');
-      _publishing = false;
-      return;
-    }
+    _lastPushAt = Date.now();
+    _realtimeCooldownUntil = Date.now() + REALTIME_COOLDOWN_MS;
 
-    // 3. Backup automático
-    if (isBackupEnabled()) {
-      try {
-        exportBackup();
-        console.log('[SYNC] Backup automático descargado');
-      } catch(e) {
-        console.warn('[SYNC] No se pudo descargar backup:', e);
-      }
-    }
-
-    // 4. Publicar
-    const result = await publishToSupabase();
-    resetChangeCount();
-    setLastPublish({
-      at: result.publishedAt,
-      elapsed: result.elapsed,
-      stats: result.stats,
-      reason
-    });
-    console.log(`[SYNC] Auto-publicado (${reason}) en ${result.elapsed}s`, result.stats);
-    window.dispatchEvent(new CustomEvent('zenith:published', { detail: result }));
+    updateSyncChip('synced');
+    console.log('[SYNC] Push OK:', result.stats);
+    window.dispatchEvent(new CustomEvent('zenith:sync-pushed', { detail: result }));
 
   } catch(err) {
-    console.error('[SYNC] Error en auto-publicación:', err);
-    _lastFailureAt = Date.now();
-    window.dispatchEvent(new CustomEvent('zenith:publish-failed', { detail: err }));
+    console.error('[SYNC] Push failed:', err);
+    // Re-marcar tablas como sucias para reintentar
+    tablesToPush.forEach(t => _dirtyTables.add(t));
+    updateSyncChip('error');
+    setTimeout(() => schedulePush(), 5000);
   } finally {
-    _publishing = false;
+    _isPushing = false;
   }
 }
 
 // ============================================================
-// PUBLICACIÓN MANUAL (forzar)
+// REALTIME: Cambios remotos
 // ============================================================
-export async function publishNow() {
-  cancelTimer();
-  await triggerPublish('manual');
+let _realtimeDebounce = null;
+
+function onRemoteChange(table) {
+  // Ignorar si estamos en cooldown post-push (podría ser nuestro propio cambio)
+  if (Date.now() < _realtimeCooldownUntil) {
+    return;
+  }
+  // Ignorar si estamos en medio de un push
+  if (_isPushing) return;
+
+  console.log('[SYNC] Cambio remoto detectado en:', table);
+
+  // Debounce para agrupar cambios
+  if (_realtimeDebounce) clearTimeout(_realtimeDebounce);
+  _realtimeDebounce = setTimeout(() => {
+    pullFromRemote().catch(err => console.error('[SYNC] pull error:', err));
+  }, 800);
+}
+
+async function pullFromRemote() {
+  try {
+    updateSyncChip('pulling');
+    const remoteDB = await downloadAll();
+
+    // Preservar preferencias locales (widgets por instancia, etc.)
+    const localRaw = window.__zenithGetRawDB ? window.__zenithGetRawDB() : null;
+
+    // Merge inteligente:
+    // - Tablas de tiempo real: reemplazar
+    // - Config: preservar widgets locales si existen
+    const merged = {
+      ...remoteDB,
+      widgets: localRaw?.widgets || remoteDB.widgets,
+      viewSeasonId: localRaw?.viewSeasonId || null
+    };
+
+    if (window.__zenithSetRawDB) {
+      window.__zenithSetRawDB(merged);
+    }
+
+    // Resetear hashes (para no marcar como dirty)
+    Object.assign(_lastHashes, captureHashes(merged));
+
+    updateSyncChip('synced');
+    window.dispatchEvent(new CustomEvent('zenith:sync-pulled'));
+
+  } catch(err) {
+    console.error('[SYNC] Pull failed:', err);
+    updateSyncChip('error');
+  }
+}
+
+// ============================================================
+// CHIP DE ESTADO
+// ============================================================
+function updateSyncChip(state) {
+  window.dispatchEvent(new CustomEvent('zenith:sync-chip', { detail: state }));
 }
 
 // ============================================================
 // INIT
 // ============================================================
-export function initSync() {
-  loadChangeCount();
-  console.log('[SYNC] Inicializado. Cambios pendientes:', _changeCount);
+export async function initRealtimeSync() {
+  if (_initialized) return;
+  _initialized = true;
+
+  subscribeRealtime(onRemoteChange);
+
+  // Resetear cooldown al boot
+  _realtimeCooldownUntil = Date.now() + 1000;
+  updateSyncChip('synced');
+
+  // Actualizar chip cuando cambie la conexión
+  window.addEventListener('online', () => updateSyncChip('online'));
+  window.addEventListener('offline', () => updateSyncChip('offline'));
+}
+
+export function destroySync() {
+  unsubscribeRealtime();
+  _initialized = false;
+}
+
+// ============================================================
+// FORZAR SYNC MANUAL (para debug/uso)
+// ============================================================
+export async function forcePull() {
+  await pullFromRemote();
+}
+
+export async function forcePush() {
+  Object.keys(TABLE_TO_KEY).forEach(t => _dirtyTables.add(t));
+  await doPush();
+}
+
+// ============================================================
+// STATE
+// ============================================================
+export function getSyncState() {
+  return {
+    dirtyCount: _dirtyTables.size,
+    lastPushAt: _lastPushAt,
+    isPushing: _isPushing,
+    isOnline: navigator.onLine
+  };
+}
+
+export function captureCurrentHashes() {
+  const db = window.__zenithGetRawDB ? window.__zenithGetRawDB() : null;
+  if (!db) return {};
+  return captureHashes(db);
 }
