@@ -1126,3 +1126,76 @@ img.zenith-emoji{width:1.05em;height:1.05em;display:inline-block;vertical-align:
 .bracket-v6-wrap::-webkit-scrollbar-corner {
   background: var(--bg-graphite);
 }
+
+/* ============================================================
+   v2.6 — SYNC CHIP + PUBLISH BUTTON
+   ============================================================ */
+
+/* ──── CHIP DE ESTADO SYNC ──── */
+#syncChip {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  padding: 4px 10px;
+  transition: all 0.2s ease;
+  border-radius: 100px;
+}
+
+#syncChip.sync-online {
+  color: var(--success);
+  border-color: rgba(99, 194, 138, 0.4);
+  background: rgba(99, 194, 138, 0.08);
+  box-shadow: 0 0 8px rgba(99, 194, 138, 0.15);
+}
+
+#syncChip.sync-offline {
+  color: var(--danger);
+  border-color: rgba(226, 92, 92, 0.4);
+  background: rgba(226, 92, 92, 0.08);
+}
+
+#syncChip.sync-syncing {
+  color: var(--accent);
+  border-color: rgba(111, 168, 255, 0.4);
+  background: rgba(111, 168, 255, 0.08);
+  animation: pulseSync 1.4s ease-in-out infinite;
+}
+
+#syncChip.sync-error {
+  color: var(--gold);
+  border-color: rgba(230, 196, 118, 0.4);
+  background: rgba(230, 196, 118, 0.08);
+}
+
+@keyframes pulseSync {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(111, 168, 255, 0.35); }
+  50%      { box-shadow: 0 0 0 6px rgba(111, 168, 255, 0); }
+}
+
+/* ──── BOTÓN PUBLICAR EN TOPBAR ──── */
+#btnPublishTopbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  font-weight: 700;
+  text-transform: uppercase;
+  transition: 0.15s ease;
+}
+
+#btnPublishTopbar.btn-primary {
+  box-shadow: 0 0 12px rgba(111, 168, 255, 0.35);
+}
+
+#btnPublishTopbar:hover {
+  transform: translateY(-1px);
+}
+
+#btnPublishTopbar:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
