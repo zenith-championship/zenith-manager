@@ -12,7 +12,7 @@ import {
 import { canFinishSeason, finishSeason, resetDivisions } from '../services/seasons.js';
 import { uid, getDefaultWidgets, getWidgetType } from '../data/database.js';
 import { state } from '../state.js';
-import { getSupabase, testConnection, downloadAll, forcePull as forcePullSupabase } from '../services/supabase.js';
+import { getSupabase, testConnection, downloadAll } from '../services/supabase.js';
 import { login, logout, getCurrentUser } from '../services/auth.js';
 import { forcePush, forcePull, getSyncState } from '../services/sync.js';
 
