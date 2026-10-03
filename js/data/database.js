@@ -57,6 +57,30 @@ REGLAS GENERALES:
 - Si detectas algún problema, inclúyelo en warnings.`;
 
 // ============================================================
+// TEMA POR DEFECTO
+// ============================================================
+export function getDefaultTheme(){
+  return {
+    name: 'Zenith Default',
+    brandName: 'ZENITH',
+    brandMotto: 'YOUR LEVEL IS NOT YOUR LIMIT',
+    logo: '',
+    background: {
+      type: 'gradient',
+      solidColor: '#050505',
+      gradientColors: ['#050505', '#0A0A0C', '#121316'],
+      gradientAngle: 135
+    },
+    colors: {
+      accent: '#6FA8FF',
+      gold: '#E6C476',
+      danger: '#E25C5C',
+      success: '#63C28A'
+    }
+  };
+}
+
+// ============================================================
 // WIDGETS POR DEFECTO
 // ============================================================
 export function getDefaultWidgets(){
@@ -154,6 +178,10 @@ export function defaultDatabase(){
         model: 'gemini-2.0-flash',
         matchThresholds: { high: 0.9, low: 0.5 },
         systemPrompt: DEFAULT_SYSTEM_PROMPT
+      },
+      theme: {
+        active: getDefaultTheme(),
+        presets: []
       }
     },
 
