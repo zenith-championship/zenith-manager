@@ -147,7 +147,8 @@ export async function downloadAll() {
       pigWeights: configData.pigWeights || { goal:2, assist:1.5, save:1, missDivisor:5 },
       badStreak: configData.badStreak || { enabled:true, minGames:5, consecutiveLosses:3, penalty:0.1 },
       seasonEnd: configData.seasonEnd || { autoAssignTrophies:true, requireAllDivisions:true },
-      ai: configData.ai || null
+      ai: configData.ai || null,
+      theme: configData.theme || null
     },
     widgets: configData.widgets || null,
     trophies: configData.trophies || {},
@@ -270,7 +271,8 @@ export async function pushTables(tables) {
           widgets: db.widgets || [],
           trophies: db.trophies || {},
           transferLog: db.transferLog || [],
-          transferBannerBg: db.transferBannerBg || ''
+          transferBannerBg: db.transferBannerBg || '',
+          theme: db.config?.theme || null
         };
         const { error: cfgErr } = await sb.from('config').upsert({ id: 1, data: cfgData });
         if (cfgErr) throw new Error('config: ' + cfgErr.message);
