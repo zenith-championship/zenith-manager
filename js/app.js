@@ -6,6 +6,7 @@ import { initRealtimeSync, captureCurrentHashes, notifyChange, getSyncState } fr
 import { refreshAuthState, bindTopbarStatusButton, setupSyncChipListener, isAuthenticated } from './views/config.js';
 import { downloadAll } from './services/supabase.js';
 import { openModal, closeTopModal, toast } from './services/ui.js';
+import { applyTheme } from './services/theme.js';
 
 import { dashboardView, bindDashboardEvents } from './views/dashboard.js';
 import { teamsView, bindTeamsEvents } from './views/teams.js';
@@ -51,7 +52,6 @@ function showLoadOverlay(text){
   if (!overlay) return;
   const title = document.getElementById('zenithLoadTitle');
   if (title && text) title.textContent = text;
-  // Forzar reflow para que la transición funcione
   void overlay.offsetWidth;
   overlay.classList.add('visible');
 }
@@ -110,7 +110,6 @@ function confirmDiscardChanges(count){
 export async function performInitialDownload(opts = {}){
   const { skipConfirm = false, reason = 'boot' } = opts;
 
-  // Evitar dobles descargas en la misma sesión
   if (window.__zenithHasDownloadedThisSession) {
     console.log('[APP] Ya se descargó en esta sesión, skip');
     return { skipped: true };
@@ -120,7 +119,6 @@ export async function performInitialDownload(opts = {}){
     return { skipped: true, error: 'no-auth' };
   }
 
-  // Verificar cambios pendientes
   const syncState = getSyncState();
   if (syncState.dirtyCount > 0 && !skipConfirm) {
     const confirmed = await confirmDiscardChanges(syncState.dirtyCount);
@@ -135,7 +133,6 @@ export async function performInitialDownload(opts = {}){
     const remoteDB = await downloadAll();
     const localRaw = getRawDB();
 
-    // ✅ FIX: El servidor es la fuente de verdad. Solo preservamos viewSeasonId (local).
     const merged = {
       ...remoteDB,
       viewSeasonId: localRaw?.viewSeasonId || null
@@ -143,7 +140,14 @@ export async function performInitialDownload(opts = {}){
 
     setRawDB(merged);
 
-    // Validar que la división activa siga existiendo
+    // ✅ Aplicar tema tras descarga
+    try {
+      const themeActive = getDB().config?.theme?.active;
+      applyTheme(themeActive);
+    } catch(themeErr) {
+      console.warn('[APP] No se pudo aplicar el tema tras descarga:', themeErr);
+    }
+
     const dbAfter = getDB();
     const visible = dbAfter.divisions.filter(d => d.visible !== false);
     if (!dbAfter.divisions.find(d => d.id === state.divisionId)) {
@@ -153,7 +157,6 @@ export async function performInitialDownload(opts = {}){
 
     window.__zenithHasDownloadedThisSession = true;
 
-    // Resetear hashes para no marcar como dirty
     if (window.__zenithCaptureHashes) {
       window.__zenithCaptureHashes();
     }
@@ -171,7 +174,6 @@ export async function performInitialDownload(opts = {}){
   }
 }
 
-// Exponer al window para que config.js lo use
 window.__zenithPerformInitialDownload = performInitialDownload;
 
 // ============================================================
@@ -181,9 +183,17 @@ async function boot(){
   try {
     createLoadOverlay();
 
-    // Cargar DB local primero (rápido, muestra lo que hay)
     loadDB();
     loadActiveDivision();
+
+    // ✅ Aplicar tema al arrancar
+    try {
+      const themeActive = getDB().config?.theme?.active;
+      applyTheme(themeActive);
+    } catch(themeErr) {
+      console.warn('[APP] No se pudo aplicar el tema al arrancar:', themeErr);
+    }
+
     const db = getDB();
     const visible = db.divisions.filter(d => d.visible !== false);
     if (!state.divisionId || !db.divisions.find(d => d.id === state.divisionId)) {
@@ -191,7 +201,6 @@ async function boot(){
       if (state.divisionId) saveActiveDivision(state.divisionId);
     }
 
-    // Init auth
     try {
       await refreshAuthState();
       bindTopbarStatusButton();
@@ -200,12 +209,9 @@ async function boot(){
       console.warn('[ZENITH] Auth init falló:', authErr);
     }
 
-    // Init realtime
     await initRealtimeSync();
 
-    // Descarga automática si está autenticado
     if (isAuthenticated()) {
-      // Pequeño delay para que el DOM esté listo
       await new Promise(r => setTimeout(r, 100));
       await performInitialDownload({ reason: 'boot' });
     }
@@ -289,6 +295,13 @@ startRouter((viewFn, params) => {
 // Listener para re-render cuando llega sync remoto
 window.addEventListener('zenith:sync-pulled', () => {
   console.log('[APP] Datos actualizados desde Supabase (realtime)');
+  // ✅ Re-aplicar tema tras un pull remoto
+  try {
+    const themeActive = getDB().config?.theme?.active;
+    applyTheme(themeActive);
+  } catch(themeErr) {
+    console.warn('[APP] No se pudo aplicar el tema tras pull remoto:', themeErr);
+  }
   refreshView();
 });
 
