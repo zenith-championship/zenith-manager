@@ -1,4 +1,4 @@
-import { defaultDatabase, SCHEMA_VERSION, DEFAULT_ZONES, getDefaultWidgets } from '../data/database.js';
+import { defaultDatabase, SCHEMA_VERSION, DEFAULT_ZONES, getDefaultWidgets, getDefaultTheme } from '../data/database.js';
 
 const KEY = 'ZENITH_DB_V3';
 const OLD_KEYS = ['ZENITH_DB_V2', 'ZENITH_DB_V1'];
@@ -134,6 +134,43 @@ function migrateWidgets(db){
 }
 
 // ============================================================
+// MIGRACIÓN DEL TEMA
+// ============================================================
+function migrateTheme(db){
+  const defaults = getDefaultTheme();
+  if (!db.config.theme || typeof db.config.theme !== 'object') {
+    db.config.theme = { active: defaults, presets: [] };
+    return;
+  }
+  if (!db.config.theme.active || typeof db.config.theme.active !== 'object') {
+    db.config.theme.active = defaults;
+  }
+  // Rellenar campos faltantes en active
+  db.config.theme.active = deepMerge(defaults, db.config.theme.active);
+  // Asegurar array de presets
+  if (!Array.isArray(db.config.theme.presets)) {
+    db.config.theme.presets = [];
+  }
+}
+
+function deepMerge(defaults, overrides){
+  if (!overrides) return JSON.parse(JSON.stringify(defaults));
+  const result = JSON.parse(JSON.stringify(defaults));
+  Object.keys(overrides).forEach(key => {
+    const val = overrides[key];
+    if (val === null || val === undefined) return;
+    if (Array.isArray(val)) {
+      result[key] = val.slice();
+    } else if (typeof val === 'object') {
+      result[key] = deepMerge(result[key] || {}, val);
+    } else {
+      result[key] = val;
+    }
+  });
+  return result;
+}
+
+// ============================================================
 // MIGRACIÓN GENERAL
 // ============================================================
 function migrate(db){
@@ -169,6 +206,7 @@ function migrate(db){
     db.config.ai.model = 'gemini-2.0-flash';
   }
 
+  migrateTheme(db);
   migrateWidgets(db);
 
   db.divisions.forEach(d => {
@@ -245,6 +283,8 @@ function migrateSnapshot(snapshot, liveDB){
   s.config ||= JSON.parse(JSON.stringify(liveDB.config));
   if(!s.config.seasonEnd) s.config.seasonEnd = { autoAssignTrophies:true, requireAllDivisions:true };
   if(!s.config.ai) s.config.ai = JSON.parse(JSON.stringify(liveDB.config.ai));
+  // El tema siempre viene del liveDB (no se archiva con el snapshot)
+  s.config.theme = JSON.parse(JSON.stringify(liveDB.config.theme || { active: getDefaultTheme(), presets: [] }));
 
   s.widgets = liveDB.widgets;
   s.archivedSeasons = liveDB.archivedSeasons;
@@ -256,8 +296,8 @@ function migrateSnapshot(snapshot, liveDB){
   s.news.forEach(normalizeNews);
   s.matches.forEach(m => {
     if(!m.format) m.format = 'BO3';
-    if(!m.date) m.date = '';
-    if(!m.time) m.time = '';
+    if(!m.date)   m.date = '';
+    if(!m.time)   m.time = '';
     if(!Array.isArray(m.games)) m.games = [];
   });
 
